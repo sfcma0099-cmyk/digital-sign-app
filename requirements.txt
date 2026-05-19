@@ -1,4 +1,6 @@
-streamlit
-streamlit-drawable-canvas
-Pillow
-requests
+streamlit>=1.30
+gspread==6.1.4
+google-auth>=2.0.0
+pillow>=10.0.0
+numpy>=1.24.0
+streamlit-drawable-canvas-fix==0.9.8
