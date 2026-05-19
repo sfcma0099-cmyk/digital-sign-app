@@ -1,6 +1,7 @@
 import base64
 import csv
 import hashlib
+import html
 import hmac
 import json
 import secrets
@@ -13,7 +14,9 @@ import gspread
 import numpy as np
 import streamlit as st
 from google.oauth2.service_account import Credentials
-from PIL import Image
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
+from PIL import Image, ImageOps
 from streamlit_drawable_canvas import st_canvas
 
 
@@ -50,6 +53,12 @@ HEADERS = [
     "signature_png_base64",
     "signature_json",
     "signed_device_hint",
+    "signature_image_url",
+    "receipt_file_url",
+    "receipt_folder_url",
+    "billing_month",
+    "billing_status",
+    "archive_note",
 ]
 
 STATUS_PENDING = "未簽收"
@@ -85,6 +94,28 @@ def get_required_config():
     return app_base_url, admin_password, sheet_id, service_account_info
 
 
+
+def get_drive_folder_id() -> str:
+    """Google Drive 母資料夾 ID。這個資料夾要分享給 service account 並給編輯者權限。"""
+    return str(get_secret("GOOGLE_DRIVE_FOLDER_ID", "")).strip()
+
+
+def get_google_credentials():
+    _, _, _, service_account_info = get_required_config()
+    if not service_account_info:
+        raise RuntimeError("找不到 gcp_service_account 設定。")
+
+    service_account_info = dict(service_account_info)
+    if "private_key" in service_account_info:
+        service_account_info["private_key"] = service_account_info["private_key"].replace("\\n", "\n")
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    return Credentials.from_service_account_info(service_account_info, scopes=scopes)
+
+
 def show_config_error():
     st.error("系統尚未完成設定，請先設定 Streamlit Secrets。")
     with st.expander("需要設定哪些 Secrets？", expanded=True):
@@ -93,6 +124,7 @@ def show_config_error():
 APP_BASE_URL = "https://你的-app.streamlit.app"
 ADMIN_PASSWORD = "請設定一組廠內管理密碼"
 GOOGLE_SHEET_ID = "你的 Google 試算表 ID"
+GOOGLE_DRIVE_FOLDER_ID = "你的 Google Drive 簽收憑證資料夾 ID"
 
 [gcp_service_account]
 type = "service_account"
@@ -126,17 +158,8 @@ def get_worksheet():
     if not service_account_info:
         raise RuntimeError("找不到 gcp_service_account 設定。")
 
-    # 有些貼上 Secrets 的 private_key 會把換行變成 \\n，這裡統一轉回真正換行。
-    if "private_key" in service_account_info:
-        service_account_info["private_key"] = service_account_info["private_key"].replace("\\n", "\n")
-
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-
     try:
-        credentials = Credentials.from_service_account_info(service_account_info, scopes=scopes)
+        credentials = get_google_credentials()
         client = gspread.authorize(credentials)
         spreadsheet = client.open_by_key(sheet_id)
         worksheet = spreadsheet.sheet1
@@ -187,9 +210,30 @@ def today_text() -> str:
 
 
 def get_all_records():
+    """
+    讀取 Google Sheet 全部資料。
+    不使用 gspread 的 get_all_records()，避免第一列標題有重複、空白或舊欄位時直接報錯。
+    固定用程式內建 HEADERS 當欄位標準，比較適合 MVP 持續升級。
+    """
     ws = get_worksheet()
     ensure_headers(ws)
-    return ws.get_all_records(default_blank="")
+
+    values = ws.get_all_values()
+    if not values or len(values) <= 1:
+        return []
+
+    records = []
+    for row in values[1:]:
+        if not any(str(cell).strip() for cell in row):
+            continue
+
+        padded_row = list(row) + [""] * max(0, len(HEADERS) - len(row))
+        record = {}
+        for index, header in enumerate(HEADERS):
+            record[header] = padded_row[index] if index < len(padded_row) else ""
+        records.append(record)
+
+    return records
 
 
 def find_record_by_token(token: str):
@@ -252,6 +296,137 @@ def admin_login():
     return False
 
 
+
+# ---------- Google Drive 憑證保存 ----------
+@st.cache_resource(show_spinner=False)
+def get_drive_service():
+    credentials = get_google_credentials()
+    return build("drive", "v3", credentials=credentials, cache_discovery=False)
+
+
+def drive_escape_query_value(text: str) -> str:
+    return str(text).replace("'", "\\'")
+
+
+def get_or_create_drive_folder(name: str, parent_id: str) -> str:
+    """在指定 parent folder 下找同名資料夾；不存在就建立。"""
+    service = get_drive_service()
+    safe_name = drive_escape_query_value(name)
+    safe_parent = drive_escape_query_value(parent_id)
+    query = (
+        "mimeType='application/vnd.google-apps.folder' "
+        f"and name='{safe_name}' "
+        f"and '{safe_parent}' in parents "
+        "and trashed=false"
+    )
+
+    result = service.files().list(
+        q=query,
+        spaces="drive",
+        fields="files(id, name, webViewLink)",
+        pageSize=1,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
+
+    files = result.get("files", [])
+    if files:
+        return files[0]["id"]
+
+    metadata = {
+        "name": name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_id],
+    }
+    folder = service.files().create(
+        body=metadata,
+        fields="id, webViewLink",
+        supportsAllDrives=True,
+    ).execute()
+    return folder["id"]
+
+
+def upload_bytes_to_drive(filename: str, data: bytes, mime_type: str, parent_id: str) -> dict:
+    service = get_drive_service()
+    metadata = {"name": filename, "parents": [parent_id]}
+    media = MediaIoBaseUpload(BytesIO(data), mimetype=mime_type, resumable=False)
+    created = service.files().create(
+        body=metadata,
+        media_body=media,
+        fields="id, name, webViewLink",
+        supportsAllDrives=True,
+    ).execute()
+    return created
+
+
+def month_from_record(record: dict) -> str:
+    for key in ("delivery_date", "signed_at", "created_at"):
+        value = str(record.get(key, "") or "").strip()
+        if len(value) >= 7:
+            return value[:7]
+    return datetime.now(TAIPEI_TZ).strftime("%Y-%m")
+
+
+def drive_folder_url(folder_id: str) -> str:
+    return f"https://drive.google.com/drive/folders/{folder_id}" if folder_id else ""
+
+
+def save_company_accounting_copy_to_drive(record: dict) -> dict:
+    """
+    數位化後的公司/帳務聯：
+    - 簽收憑證 HTML 存 Google Drive
+    - 簽名或簽章圖片也存 Google Drive
+    - Google Sheet 只保存連結與台帳欄位
+    """
+    parent_folder_id = get_drive_folder_id()
+    if not parent_folder_id:
+        return {"archive_note": "未設定 GOOGLE_DRIVE_FOLDER_ID，尚未自動保存到 Google Drive。"}
+
+    client_name = str(record.get("client_name", "") or "未命名客戶")
+    product_name = str(record.get("product_name", "") or "未命名品名")
+    month_text = month_from_record(record)
+
+    month_folder_id = get_or_create_drive_folder(month_text, parent_folder_id)
+    client_folder_id = get_or_create_drive_folder(client_name, month_folder_id)
+
+    date_text = str(record.get("delivery_date", "") or datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d"))
+    client_safe = safe_filename_text(client_name)
+    product_safe = safe_filename_text(product_name)
+    token_safe = safe_filename_text(record.get("token", ""))[:12]
+    file_prefix = f"{date_text}_{client_safe}_{product_safe}_{token_safe}"
+
+    result = {
+        "receipt_folder_url": drive_folder_url(client_folder_id),
+        "billing_month": month_text,
+        "billing_status": str(record.get("billing_status", "") or "未結帳"),
+        "archive_note": "已自動保存公司/帳務聯到 Google Drive。",
+    }
+
+    signature_b64 = str(record.get("signature_png_base64", "") or "")
+    signature_mime_type = get_signature_mime_type(record)
+    if signature_b64:
+        ext = "jpg" if signature_mime_type == "image/jpeg" else "png"
+        signature_bytes = base64.b64decode(signature_b64)
+        signature_file = upload_bytes_to_drive(
+            filename=f"{file_prefix}_簽收圖像.{ext}",
+            data=signature_bytes,
+            mime_type=signature_mime_type,
+            parent_id=client_folder_id,
+        )
+        result["signature_image_url"] = signature_file.get("webViewLink", "")
+
+    receipt_html = build_receipt_html(record)
+    receipt_file = upload_bytes_to_drive(
+        filename=f"{file_prefix}_簽收憑證.html",
+        data=receipt_html.encode("utf-8"),
+        mime_type="text/html",
+        parent_id=client_folder_id,
+    )
+    result["receipt_file_url"] = receipt_file.get("webViewLink", "")
+
+    return result
+
+
 # ---------- 簽名處理 ----------
 def canvas_to_png_base64(image_data) -> str:
     """
@@ -295,6 +470,86 @@ def canvas_to_png_base64(image_data) -> str:
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
+
+def uploaded_image_to_signature_base64(uploaded_file):
+    """
+    將客戶上傳的簽章圖片壓縮成可存入 Google Sheet 的 base64。
+    使用 JPEG 是因為手機照片通常很大，壓縮後比較不會超過 Google Sheet 單格限制。
+    """
+    if uploaded_file is None:
+        return "", "image/jpeg"
+
+    raw_bytes = uploaded_file.getvalue()
+    img = Image.open(BytesIO(raw_bytes))
+    img = ImageOps.exif_transpose(img)
+
+    if img.mode in ("RGBA", "LA"):
+        background = Image.new("RGB", img.size, "white")
+        background.paste(img.convert("RGBA"), mask=img.convert("RGBA").split()[-1])
+        img = background
+    else:
+        img = img.convert("RGB")
+
+    # 多輪壓縮，確保 base64 長度低於 Google Sheet 單格上限。
+    attempts = [
+        ((640, 360), 82),
+        ((520, 300), 76),
+        ((420, 260), 70),
+        ((340, 220), 64),
+        ((280, 180), 58),
+    ]
+
+    last_b64 = ""
+    for size, quality in attempts:
+        work_img = img.copy()
+        work_img.thumbnail(size)
+
+        buffer = BytesIO()
+        work_img.save(buffer, format="JPEG", quality=quality, optimize=True)
+        b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+        last_b64 = b64
+
+        if len(b64) <= 45000:
+            return b64, "image/jpeg"
+
+    return last_b64, "image/jpeg"
+
+
+def get_signature_metadata(record: dict) -> dict:
+    raw = str(record.get("signature_json", "") or "").strip()
+    if not raw:
+        return {}
+
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        return {}
+
+    return {}
+
+
+def get_signature_method_label(record: dict) -> str:
+    metadata = get_signature_metadata(record)
+    method = str(metadata.get("method", "") or record.get("signed_device_hint", ""))
+
+    if method == "stamp_image_upload":
+        return "簽章圖片"
+
+    return "電子簽名"
+
+
+def get_signature_mime_type(record: dict) -> str:
+    metadata = get_signature_metadata(record)
+    mime_type = str(metadata.get("mime_type", "") or "").strip()
+
+    if mime_type in ("image/png", "image/jpeg", "image/webp"):
+        return mime_type
+
+    return "image/png"
+
+
 def show_signature_from_base64(signature_b64: str):
     if not signature_b64:
         st.info("此簽收紀錄沒有簽名圖。")
@@ -335,6 +590,12 @@ def make_empty_record(
         "signature_png_base64": "",
         "signature_json": "",
         "signed_device_hint": "",
+        "signature_image_url": "",
+        "receipt_file_url": "",
+        "receipt_folder_url": "",
+        "billing_month": delivery_date[:7] if delivery_date else "",
+        "billing_status": "未結帳",
+        "archive_note": "",
     }
 
 
@@ -507,14 +768,25 @@ def admin_dashboard_tab():
                 "品名/單號": r.get("product_name", ""),
                 "數量": r.get("quantity", ""),
                 "簽收時間": r.get("signed_at", ""),
-                "簽收人": r.get("signer_name", ""),
-                "電話": r.get("signer_phone", ""),
+                "簽收方式": get_signature_method_label(r) if r.get("status") == STATUS_SIGNED else "",
+                "月結狀態": r.get("billing_status", ""),
+                "簽收憑證": r.get("receipt_file_url", ""),
+                "簽收圖像": r.get("signature_image_url", ""),
                 "備註": r.get("note", ""),
                 "簽收連結": r.get("sign_url", ""),
             }
         )
 
-    st.dataframe(display_rows, use_container_width=True, hide_index=True)
+    st.dataframe(
+        display_rows,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "簽收憑證": st.column_config.LinkColumn("簽收憑證"),
+            "簽收圖像": st.column_config.LinkColumn("簽收圖像"),
+            "簽收連結": st.column_config.LinkColumn("簽收連結"),
+        },
+    )
 
     st.write("---")
     st.write("### 查看單筆簽名")
@@ -538,6 +810,199 @@ def admin_dashboard_tab():
     show_signature_from_base64(str(selected.get("signature_png_base64", "")))
 
 
+
+
+# ---------- 簽收憑證 / 客戶留底 ----------
+def safe_filename_text(text: str) -> str:
+    text = str(text or "").strip()
+    keep = []
+    for ch in text:
+        if ch.isalnum() or ch in ("-", "_"):
+            keep.append(ch)
+        elif ch in (" ", ".", "．"):
+            keep.append("_")
+    result = "".join(keep).strip("_")
+    return result[:60] or "receipt"
+
+
+def build_receipt_html(record: dict) -> str:
+    """
+    建立客戶可下載留底的 HTML 簽收憑證。
+    HTML 比 PDF 更適合第一版：手機、電腦都能直接開，也能用瀏覽器另存 PDF。
+    """
+    company_name = "新豐製版"
+    client_name = html.escape(str(record.get("client_name", "")))
+    product_name = html.escape(str(record.get("product_name", "")))
+    quantity = html.escape(str(record.get("quantity", "")))
+    delivery_date = html.escape(str(record.get("delivery_date", "")))
+    note = html.escape(str(record.get("note", "")))
+    signed_at = html.escape(str(record.get("signed_at", "")))
+    signer_name = html.escape(str(record.get("signer_name", "")))
+    signer_phone = html.escape(str(record.get("signer_phone", "")))
+    signer_note = html.escape(str(record.get("signer_note", "")))
+    token = html.escape(str(record.get("token", "")))
+    sign_url = html.escape(str(record.get("sign_url", "")))
+    signature_b64 = str(record.get("signature_png_base64", "") or "")
+    signature_mime_type = html.escape(get_signature_mime_type(record))
+    signature_method = html.escape(get_signature_method_label(record))
+
+    signature_html = ""
+    if signature_b64:
+        signature_html = f'<img class="signature" src="data:{signature_mime_type};base64,{signature_b64}" alt="簽收圖像">'
+
+    return f'''<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{company_name}｜簽收憑證</title>
+<style>
+body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Noto Sans TC", "Microsoft JhengHei", Arial, sans-serif;
+    background: #f6f7f9;
+    color: #222;
+    margin: 0;
+    padding: 24px;
+}}
+.receipt {{
+    max-width: 760px;
+    margin: 0 auto;
+    background: #fff;
+    border: 1px solid #ddd;
+    border-radius: 16px;
+    padding: 28px;
+}}
+h1 {{
+    margin: 0 0 8px;
+    font-size: 28px;
+}}
+.subtitle {{
+    color: #666;
+    margin-bottom: 24px;
+}}
+.status {{
+    display: inline-block;
+    background: #e8f7ee;
+    color: #126b34;
+    border: 1px solid #b9e5c9;
+    border-radius: 999px;
+    padding: 6px 12px;
+    font-weight: 700;
+    margin-bottom: 18px;
+}}
+table {{
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 12px;
+}}
+th, td {{
+    text-align: left;
+    border-bottom: 1px solid #eee;
+    padding: 12px 8px;
+    vertical-align: top;
+}}
+th {{
+    width: 160px;
+    color: #555;
+    font-weight: 700;
+}}
+.signature-box {{
+    margin-top: 24px;
+    border: 1px dashed #aaa;
+    border-radius: 12px;
+    padding: 16px;
+    min-height: 120px;
+}}
+.signature {{
+    max-width: 100%;
+    max-height: 220px;
+}}
+.footer {{
+    margin-top: 24px;
+    color: #777;
+    font-size: 13px;
+    line-height: 1.6;
+}}
+@media print {{
+    body {{ background: #fff; padding: 0; }}
+    .receipt {{ border: none; border-radius: 0; }}
+}}
+</style>
+</head>
+<body>
+<div class="receipt">
+    <h1>{company_name}｜簽收憑證</h1>
+    <div class="subtitle">此憑證由數位簽收系統產生，供客戶與廠內雙方留存。</div>
+    <div class="status">已簽收</div>
+
+    <table>
+        <tr><th>客戶名稱</th><td>{client_name}</td></tr>
+        <tr><th>品名 / 刀模編號</th><td>{product_name}</td></tr>
+        <tr><th>數量</th><td>{quantity}</td></tr>
+        <tr><th>出貨日期</th><td>{delivery_date}</td></tr>
+        <tr><th>廠內備註</th><td>{note}</td></tr>
+        <tr><th>簽收時間</th><td>{signed_at}</td></tr>
+        <tr><th>簽收方式</th><td>{signature_method}</td></tr>
+        <tr><th>電話 / 分機</th><td>{signer_phone}</td></tr>
+        <tr><th>簽收備註</th><td>{signer_note}</td></tr>
+        <tr><th>簽收單號</th><td>{token}</td></tr>
+        <tr><th>原簽收網址</th><td>{sign_url}</td></tr>
+    </table>
+
+    <div class="signature-box">
+        <strong>簽名：</strong><br>
+        {signature_html}
+    </div>
+
+    <div class="footer">
+        建議客戶下載此 HTML 檔留存；也可用瀏覽器的列印功能另存為 PDF。<br>
+        若內容有疑問，請聯絡新豐製版確認。
+    </div>
+</div>
+</body>
+</html>'''
+
+
+def build_receipt_download_filename(record: dict) -> str:
+    client = safe_filename_text(record.get("client_name", ""))
+    product = safe_filename_text(record.get("product_name", ""))
+    signed_at = safe_filename_text(str(record.get("signed_at", "")).replace(":", "").replace("-", ""))
+    return f"新豐製版_簽收憑證_{client}_{product}_{signed_at}.html"
+
+
+def show_customer_receipt(record: dict):
+    st.success("此單已完成簽收。以下資料可供客戶留底。")
+
+    with st.container(border=True):
+        st.write("### 📄 簽收憑證")
+        st.write(f"**客戶名稱：** {record.get('client_name', '')}")
+        st.write(f"**品名 / 刀模編號：** {record.get('product_name', '')}")
+        if record.get("quantity", ""):
+            st.write(f"**數量：** {record.get('quantity', '')}")
+        if record.get("delivery_date", ""):
+            st.write(f"**出貨日期：** {record.get('delivery_date', '')}")
+        st.write(f"**簽收時間：** {record.get('signed_at', '')}")
+        st.write(f"**簽收方式：** {get_signature_method_label(record)}")
+        if record.get("signer_phone", ""):
+            st.write(f"**電話 / 分機：** {record.get('signer_phone', '')}")
+        if record.get("signer_note", ""):
+            st.write(f"**簽收備註：** {record.get('signer_note', '')}")
+
+        show_signature_from_base64(str(record.get("signature_png_base64", "")))
+
+    receipt_html = build_receipt_html(record)
+    filename = build_receipt_download_filename(record)
+
+    st.download_button(
+        label="下載簽收憑證 HTML",
+        data=receipt_html.encode("utf-8"),
+        file_name=filename,
+        mime="text/html",
+        help="下載後可直接打開，也可用瀏覽器列印成 PDF。",
+    )
+
+    st.info("客戶也可以保留這個簽收網址；日後再次開啟同一連結，會看到已簽收紀錄，不會重複簽收。")
+
 # ---------- 客戶端：簽收頁 ----------
 def customer_signing_page(token: str):
     st.title("🖊️ 新豐製版｜數位簽收單")
@@ -552,7 +1017,7 @@ def customer_signing_page(token: str):
         st.error("此簽收連結無效，請聯絡新豐製版確認。")
         st.stop()
 
-    st.write("請確認以下資料，收到版後再完成簽收。")
+    st.write("請確認以下資料，收到版後以電子簽名或簽章圖片完成簽收。")
 
     with st.container(border=True):
         st.write(f"**客戶名稱：** {record.get('client_name', '')}")
@@ -565,70 +1030,131 @@ def customer_signing_page(token: str):
             st.write(f"**備註：** {record.get('note', '')}")
 
     if record.get("status") == STATUS_SIGNED:
-        st.success(f"此單已於 {record.get('signed_at', '')} 完成簽收。")
-        st.write(f"**簽收人：** {record.get('signer_name', '')}")
-        if record.get("signer_note", ""):
-            st.write(f"**簽收備註：** {record.get('signer_note', '')}")
-        show_signature_from_base64(str(record.get("signature_png_base64", "")))
+        show_customer_receipt(record)
         st.stop()
 
     st.warning("若尚未收到版，請先不要簽收。")
 
-    signer_name = st.text_input("簽收人姓名", placeholder="請輸入簽收人姓名")
-    signer_phone = st.text_input("簽收人電話 / 分機", placeholder="可留空")
     signer_note = st.text_area("簽收備註", placeholder="可留空，例如：已收到、數量確認無誤")
 
-    st.write("### 請在下方簽名")
-    canvas_result = st_canvas(
-        fill_color="rgba(255, 255, 255, 0)",
-        stroke_width=4,
-        stroke_color="#000000",
-        background_color="#FFFFFF",
-        height=220,
-        width=520,
-        drawing_mode="freedraw",
-        display_toolbar=True,
-        update_streamlit=True,
-        key=f"signature_canvas_{token}",
+    st.write("### 請選擇簽收方式")
+    sign_method = st.radio(
+        "簽收方式",
+        ["在畫面簽名", "上傳簽章圖片"],
+        horizontal=True,
+        key=f"sign_method_{token}",
     )
 
-    confirm = st.checkbox("我確認已收到上述物品，並同意送出簽收紀錄。")
+    canvas_result = None
+    stamp_uploaded_file = None
+
+    if sign_method == "在畫面簽名":
+        st.write("### 請在下方簽名")
+        canvas_result = st_canvas(
+            fill_color="rgba(255, 255, 255, 0)",
+            stroke_width=4,
+            stroke_color="#000000",
+            background_color="#FFFFFF",
+            height=220,
+            width=520,
+            drawing_mode="freedraw",
+            display_toolbar=True,
+            update_streamlit=True,
+            key=f"signature_canvas_{token}",
+        )
+    else:
+        st.write("### 上傳簽章圖片")
+        st.info("可上傳印章照片或簽章圖片。系統會壓縮後只作為本筆簽收紀錄保存。")
+        stamp_uploaded_file = st.file_uploader(
+            "選擇圖片檔",
+            type=["png", "jpg", "jpeg", "webp"],
+            accept_multiple_files=False,
+            key=f"stamp_upload_{token}",
+        )
+        if stamp_uploaded_file is not None:
+            st.image(stamp_uploaded_file, caption="簽章圖片預覽", use_container_width=True)
+
+    confirm = st.checkbox("我確認已收到上述物品，並同意以本次電子簽名或簽章圖片作為簽收紀錄。")
 
     if st.button("確認送出簽收", type="primary"):
-        if not signer_name.strip():
-            st.warning("請輸入簽收人姓名。")
-            return
-
         if not confirm:
             st.warning("請先勾選確認收到物品。")
             return
 
-        signature_png_base64 = canvas_to_png_base64(canvas_result.image_data)
+        signature_mime_type = "image/png"
+        signed_device_hint = "signature_canvas"
 
-        if not signature_png_base64:
-            st.warning("請先在簽名區簽名。")
+        if sign_method == "在畫面簽名":
+            signature_base64 = canvas_to_png_base64(canvas_result.image_data if canvas_result else None)
+
+            if not signature_base64:
+                st.warning("請先在簽名區簽名。")
+                return
+
+            signature_json = json.dumps(
+                {
+                    "method": "signature_canvas",
+                    "mime_type": "image/png",
+                    "canvas_data": canvas_result.json_data or {},
+                },
+                ensure_ascii=False,
+            )
+            signer_name_value = "電子簽收"
+
+        else:
+            if stamp_uploaded_file is None:
+                st.warning("請先上傳簽章圖片。")
+                return
+
+            try:
+                signature_base64, signature_mime_type = uploaded_image_to_signature_base64(stamp_uploaded_file)
+            except Exception:
+                st.error("簽章圖片讀取失敗，請改用 PNG/JPG 圖片重新上傳。")
+                return
+
+            if not signature_base64:
+                st.warning("請先上傳簽章圖片。")
+                return
+
+            signature_json = json.dumps(
+                {
+                    "method": "stamp_image_upload",
+                    "mime_type": signature_mime_type,
+                    "filename": stamp_uploaded_file.name,
+                },
+                ensure_ascii=False,
+            )
+            signer_name_value = "簽章圖片簽收"
+            signed_device_hint = "stamp_image_upload"
+
+        if len(signature_base64) > 45000:
+            st.error("簽收圖片資料過大，請改用較小或較清楚的圖片重新上傳，或改用畫面簽名。")
             return
-
-        if len(signature_png_base64) > 45000:
-            st.error("簽名資料過大，請按畫布工具列清除後，用較簡單的筆畫重新簽名。")
-            return
-
-        signature_json = json.dumps(canvas_result.json_data or {}, ensure_ascii=False)
 
         record["status"] = STATUS_SIGNED
         record["signed_at"] = now_text()
-        record["signer_name"] = signer_name.strip()
-        record["signer_phone"] = signer_phone.strip()
+        record["signer_name"] = signer_name_value
+        record["signer_phone"] = ""
         record["signer_note"] = signer_note.strip()
-        record["signature_png_base64"] = signature_png_base64
+        record["signature_png_base64"] = signature_base64
         record["signature_json"] = signature_json
-        record["signed_device_hint"] = "Streamlit web signing"
+        record["signed_device_hint"] = signed_device_hint
+        record["billing_month"] = month_from_record(record)
+        record["billing_status"] = record.get("billing_status", "") or "未結帳"
 
-        update_record(row_number, record)
+        with st.spinner("正在保存簽收紀錄..."):
+            try:
+                drive_result = save_company_accounting_copy_to_drive(record)
+                record.update(drive_result)
+            except Exception as exc:
+                record["archive_note"] = f"Google Drive 自動保存失敗：{type(exc).__name__}"
+                st.warning("簽收已完成，但公司/帳務聯自動保存到 Google Drive 時發生問題；請通知新豐製版確認後台紀錄。")
 
-        st.success("簽收完成，謝謝。")
+            update_record(row_number, record)
+
         st.balloons()
-        st.rerun()
+        show_customer_receipt(record)
+        st.stop()
 
 
 # ---------- 廠內端主畫面 ----------
@@ -642,6 +1168,9 @@ def admin_page():
 
     st.title("📦 新豐製版｜數位簽收管理")
     st.caption("廠內建立簽收單後，系統會產生 token 專屬連結；客戶只能透過該連結簽收。")
+
+    if not get_drive_folder_id():
+        st.warning("尚未設定 GOOGLE_DRIVE_FOLDER_ID；客戶簽收仍可完成，但公司/帳務聯不會自動保存到 Google Drive。")
 
     tab1, tab2, tab3 = st.tabs(["📝 單筆建立", "🚀 批量建立", "📋 狀態查詢"])
 
