@@ -31,7 +31,7 @@ from streamlit_drawable_canvas import st_canvas
 # ---------- 基本設定 ----------
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 
-POPULAR_CLIENTS = ["禎曜", "金森", "三和", "合歷", "佳鑫", "紙城", "謚嘉", "榮星"]
+POPULAR_CLIENTS = ["禎曜", "金森", "三和", "合歷", "佳鑫", "紙城", "易昇", "榮星"]
 
 HEADERS = [
     "token",
@@ -130,14 +130,30 @@ def get_worksheet():
     if "private_key" in service_account_info:
         service_account_info["private_key"] = service_account_info["private_key"].replace("\\n", "\n")
 
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    credentials = Credentials.from_service_account_info(service_account_info, scopes=scopes)
-    client = gspread.authorize(credentials)
-    spreadsheet = client.open_by_key(sheet_id)
-    worksheet = spreadsheet.sheet1
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
 
-    ensure_headers(worksheet)
-    return worksheet
+    try:
+        credentials = Credentials.from_service_account_info(service_account_info, scopes=scopes)
+        client = gspread.authorize(credentials)
+        spreadsheet = client.open_by_key(sheet_id)
+        worksheet = spreadsheet.sheet1
+        ensure_headers(worksheet)
+        return worksheet
+
+    except PermissionError:
+        st.error("Google Sheet 權限不足：請確認試算表已分享給 service account，且權限是「編輯者」。")
+        st.info(f"目前程式使用的 service account：{service_account_info.get('client_email', '讀取不到 client_email')}")
+        st.info(f"目前程式使用的 GOOGLE_SHEET_ID：{sheet_id}")
+        st.stop()
+
+    except Exception as exc:
+        st.error("連接 Google Sheet 時發生錯誤。")
+        st.info(f"錯誤類型：{type(exc).__name__}")
+        st.info("請檢查 Streamlit Secrets、Google Sheets API、Google Drive API，以及試算表共用權限。")
+        st.stop()
 
 
 def ensure_headers(worksheet):
