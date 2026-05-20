@@ -1249,13 +1249,13 @@ def show_customer_receipt(record: dict):
         st.link_button("開啟雲端簽收憑證", receipt_file_url)
 
         accounting_text = (
-            f"【新豐製版簽收憑證】\\n"
-            f"客戶：{record.get('client_name', '')}\\n"
-            f"品名/單號：{record.get('product_name', '')}\\n"
-            f"數量：{record.get('quantity', '')}\\n"
-            f"出貨日期：{record.get('delivery_date', '')}\\n"
-            f"業務：{record.get('sales_rep', '')}\\n"
-            f"簽收時間：{record.get('signed_at', '')}\\n"
+            f"【新豐製版簽收憑證】\n"
+            f"客戶：{record.get('client_name', '')}\n"
+            f"品名/單號：{record.get('product_name', '')}\n"
+            f"數量：{record.get('quantity', '')}\n"
+            f"出貨日期：{record.get('delivery_date', '')}\n"
+            f"業務：{record.get('sales_rep', '')}\n"
+            f"簽收時間：{record.get('signed_at', '')}\n"
             f"雲端憑證：{receipt_file_url}"
         )
         st.caption("可複製下方文字轉給客戶會計或採購留存。")
