@@ -6,6 +6,8 @@ import hmac
 import json
 import secrets
 import urllib.parse
+import urllib.request
+import urllib.error
 from datetime import datetime
 from io import BytesIO
 from zoneinfo import ZoneInfo
@@ -96,8 +98,18 @@ def get_required_config():
 
 
 def get_drive_folder_id() -> str:
-    """Google Drive 母資料夾 ID。這個資料夾要分享給 service account 並給編輯者權限。"""
+    """Google Drive 母資料夾 ID。v1.9 會交給 Google Apps Script 以使用者帳號寫入此資料夾。"""
     return str(get_secret("GOOGLE_DRIVE_FOLDER_ID", "")).strip()
+
+
+def get_drive_upload_webapp_url() -> str:
+    """Google Apps Script Web App URL，用於把簽收憑證與簽收圖像寫入使用者自己的 Google Drive。"""
+    return str(get_secret("DRIVE_UPLOAD_WEBAPP_URL", "")).strip()
+
+
+def get_drive_upload_secret() -> str:
+    """Streamlit 與 Google Apps Script 之間的簡單保護密鑰。"""
+    return str(get_secret("DRIVE_UPLOAD_SECRET", "")).strip()
 
 
 def get_google_credentials():
@@ -125,6 +137,8 @@ APP_BASE_URL = "https://你的-app.streamlit.app"
 ADMIN_PASSWORD = "請設定一組廠內管理密碼"
 GOOGLE_SHEET_ID = "你的 Google 試算表 ID"
 GOOGLE_DRIVE_FOLDER_ID = "你的 Google Drive 簽收憑證資料夾 ID"
+DRIVE_UPLOAD_WEBAPP_URL = "你的 Google Apps Script Web App URL"
+DRIVE_UPLOAD_SECRET = "你自己設定的上傳密鑰"
 
 [gcp_service_account]
 type = "service_account"
@@ -373,92 +387,106 @@ def drive_folder_url(folder_id: str) -> str:
 
 def short_error(exc: Exception) -> str:
     text = str(exc)
-    text = text.replace("\n", " ")
+    text = text.replace("\\n", " ")
     if len(text) > 900:
         text = text[:900] + "..."
     return f"{type(exc).__name__}: {text}"
 
 
+def post_to_drive_upload_webapp(payload: dict) -> dict:
+    webapp_url = get_drive_upload_webapp_url()
+    upload_secret = get_drive_upload_secret()
+
+    if not webapp_url:
+        raise RuntimeError("未設定 DRIVE_UPLOAD_WEBAPP_URL")
+    if not upload_secret:
+        raise RuntimeError("未設定 DRIVE_UPLOAD_SECRET")
+
+    payload = dict(payload)
+    payload["secret"] = upload_secret
+
+    request = urllib.request.Request(
+        webapp_url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Apps Script HTTP {exc.code}: {detail}") from exc
+
+    try:
+        data = json.loads(raw)
+    except Exception as exc:
+        raise RuntimeError(f"Apps Script 回傳不是 JSON：{raw[:500]}") from exc
+
+    if not data.get("ok"):
+        raise RuntimeError(data.get("error") or f"Apps Script 回傳失敗：{data}")
+
+    return data
+
+
 def save_company_accounting_copy_to_drive(record: dict) -> dict:
     """
-    數位化後的公司/帳務聯：
-    - 先建立月份 / 客戶資料夾
-    - 優先保存簽收憑證 HTML
-    - 再保存簽名或簽章圖片
-    - 任一階段失敗，都把明確原因寫回 archive_note，方便除錯
+    數位化後的公司/帳務聯。
+    v1.9 改由 Google Apps Script 以使用者帳號寫入 Google Drive，
+    避免 service account 沒有 storage quota 而無法上傳檔案。
     """
     parent_folder_id = get_drive_folder_id()
     if not parent_folder_id:
         return {"archive_note": "未設定 GOOGLE_DRIVE_FOLDER_ID，尚未自動保存到 Google Drive。"}
 
+    if not get_drive_upload_webapp_url() or not get_drive_upload_secret():
+        return {"archive_note": "未設定 DRIVE_UPLOAD_WEBAPP_URL 或 DRIVE_UPLOAD_SECRET，尚未自動保存到 Google Drive。"}
+
     client_name = str(record.get("client_name", "") or "未命名客戶")
     product_name = str(record.get("product_name", "") or "未命名品名")
     month_text = month_from_record(record)
-
-    result = {
-        "billing_month": month_text,
-        "billing_status": str(record.get("billing_status", "") or "未結帳"),
-        "archive_note": "",
-    }
-    notes = []
-
-    # 1. 建立資料夾
-    try:
-        month_folder_id = get_or_create_drive_folder(month_text, parent_folder_id)
-        client_folder_id = get_or_create_drive_folder(client_name, month_folder_id)
-        result["receipt_folder_url"] = drive_folder_url(client_folder_id)
-        notes.append("Drive資料夾建立成功")
-    except Exception as exc:
-        result["archive_note"] = f"Google Drive 資料夾建立失敗：{short_error(exc)}"
-        return result
-
     date_text = str(record.get("delivery_date", "") or datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d"))
+
     client_safe = safe_filename_text(client_name)
     product_safe = safe_filename_text(product_name)
     token_safe = safe_filename_text(record.get("token", ""))[:12]
     file_prefix = f"{date_text}_{client_safe}_{product_safe}_{token_safe}"
 
-    # 2. 先上傳簽收憑證 HTML
-    try:
-        receipt_html = build_receipt_html(record)
-        receipt_file = upload_bytes_to_drive(
-            filename=f"{file_prefix}_簽收憑證.html",
-            data=receipt_html.encode("utf-8"),
-            mime_type="text/html",
-            parent_id=client_folder_id,
-        )
-        result["receipt_file_url"] = receipt_file.get("webViewLink", "")
-        notes.append("簽收憑證HTML上傳成功")
-    except Exception as exc:
-        notes.append(f"簽收憑證HTML上傳失敗：{short_error(exc)}")
+    receipt_html = build_receipt_html(record)
+    receipt_b64 = base64.b64encode(receipt_html.encode("utf-8")).decode("utf-8")
 
-    # 3. 再上傳簽收圖像
     signature_b64 = str(record.get("signature_png_base64", "") or "")
-    if signature_b64:
-        try:
-            signature_mime_type = get_signature_mime_type(record)
-            ext = "jpg" if signature_mime_type == "image/jpeg" else "png"
-            signature_bytes = base64.b64decode(signature_b64)
-            signature_file = upload_bytes_to_drive(
-                filename=f"{file_prefix}_簽收圖像.{ext}",
-                data=signature_bytes,
-                mime_type=signature_mime_type,
-                parent_id=client_folder_id,
-            )
-            result["signature_image_url"] = signature_file.get("webViewLink", "")
-            notes.append("簽收圖像上傳成功")
-        except Exception as exc:
-            notes.append(f"簽收圖像上傳失敗：{short_error(exc)}")
-    else:
-        notes.append("沒有簽收圖像可上傳")
+    signature_mime_type = get_signature_mime_type(record)
+    signature_ext = "jpg" if signature_mime_type == "image/jpeg" else "png"
 
-    if result.get("receipt_file_url") or result.get("signature_image_url"):
-        notes.append("公司/帳務聯至少部分保存成功")
-    else:
-        notes.append("公司/帳務聯檔案未成功保存；請依前方錯誤原因處理")
+    payload = {
+        "parentFolderId": parent_folder_id,
+        "month": month_text,
+        "clientName": client_name,
+        "productName": product_name,
+        "receiptFilename": f"{file_prefix}_簽收憑證.html",
+        "receiptContentBase64": receipt_b64,
+        "signatureFilename": f"{file_prefix}_簽收圖像.{signature_ext}" if signature_b64 else "",
+        "signatureContentBase64": signature_b64,
+        "signatureMimeType": signature_mime_type,
+    }
 
-    result["archive_note"] = "；".join(notes)
-    return result
+    result = {
+        "billing_month": month_text,
+        "billing_status": str(record.get("billing_status", "") or "未結帳"),
+    }
+
+    try:
+        app_result = post_to_drive_upload_webapp(payload)
+        result["receipt_folder_url"] = app_result.get("clientFolderUrl", "")
+        result["receipt_file_url"] = app_result.get("receiptFileUrl", "")
+        result["signature_image_url"] = app_result.get("signatureFileUrl", "")
+        result["archive_note"] = app_result.get("note", "已透過 Google Apps Script 自動保存公司/帳務聯到 Google Drive。")
+        return result
+    except Exception as exc:
+        result["archive_note"] = f"Google Apps Script 自動保存失敗：{short_error(exc)}"
+        return result
 
 
 # ---------- 簽名處理 ----------
@@ -1206,6 +1234,8 @@ def admin_page():
 
     if not get_drive_folder_id():
         st.warning("尚未設定 GOOGLE_DRIVE_FOLDER_ID；客戶簽收仍可完成，但公司/帳務聯不會自動保存到 Google Drive。")
+    elif not get_drive_upload_webapp_url() or not get_drive_upload_secret():
+        st.warning("尚未設定 DRIVE_UPLOAD_WEBAPP_URL 或 DRIVE_UPLOAD_SECRET；客戶簽收仍可完成，但公司/帳務聯不會自動保存到 Google Drive。")
 
     tab1, tab2, tab3 = st.tabs(["📝 單筆建立", "🚀 批量建立", "📋 狀態查詢"])
 
