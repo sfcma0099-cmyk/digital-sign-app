@@ -371,12 +371,21 @@ def drive_folder_url(folder_id: str) -> str:
     return f"https://drive.google.com/drive/folders/{folder_id}" if folder_id else ""
 
 
+def short_error(exc: Exception) -> str:
+    text = str(exc)
+    text = text.replace("\n", " ")
+    if len(text) > 900:
+        text = text[:900] + "..."
+    return f"{type(exc).__name__}: {text}"
+
+
 def save_company_accounting_copy_to_drive(record: dict) -> dict:
     """
     數位化後的公司/帳務聯：
-    - 簽收憑證 HTML 存 Google Drive
-    - 簽名或簽章圖片也存 Google Drive
-    - Google Sheet 只保存連結與台帳欄位
+    - 先建立月份 / 客戶資料夾
+    - 優先保存簽收憑證 HTML
+    - 再保存簽名或簽章圖片
+    - 任一階段失敗，都把明確原因寫回 archive_note，方便除錯
     """
     parent_folder_id = get_drive_folder_id()
     if not parent_folder_id:
@@ -386,8 +395,22 @@ def save_company_accounting_copy_to_drive(record: dict) -> dict:
     product_name = str(record.get("product_name", "") or "未命名品名")
     month_text = month_from_record(record)
 
-    month_folder_id = get_or_create_drive_folder(month_text, parent_folder_id)
-    client_folder_id = get_or_create_drive_folder(client_name, month_folder_id)
+    result = {
+        "billing_month": month_text,
+        "billing_status": str(record.get("billing_status", "") or "未結帳"),
+        "archive_note": "",
+    }
+    notes = []
+
+    # 1. 建立資料夾
+    try:
+        month_folder_id = get_or_create_drive_folder(month_text, parent_folder_id)
+        client_folder_id = get_or_create_drive_folder(client_name, month_folder_id)
+        result["receipt_folder_url"] = drive_folder_url(client_folder_id)
+        notes.append("Drive資料夾建立成功")
+    except Exception as exc:
+        result["archive_note"] = f"Google Drive 資料夾建立失敗：{short_error(exc)}"
+        return result
 
     date_text = str(record.get("delivery_date", "") or datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d"))
     client_safe = safe_filename_text(client_name)
@@ -395,35 +418,46 @@ def save_company_accounting_copy_to_drive(record: dict) -> dict:
     token_safe = safe_filename_text(record.get("token", ""))[:12]
     file_prefix = f"{date_text}_{client_safe}_{product_safe}_{token_safe}"
 
-    result = {
-        "receipt_folder_url": drive_folder_url(client_folder_id),
-        "billing_month": month_text,
-        "billing_status": str(record.get("billing_status", "") or "未結帳"),
-        "archive_note": "已自動保存公司/帳務聯到 Google Drive。",
-    }
-
-    signature_b64 = str(record.get("signature_png_base64", "") or "")
-    signature_mime_type = get_signature_mime_type(record)
-    if signature_b64:
-        ext = "jpg" if signature_mime_type == "image/jpeg" else "png"
-        signature_bytes = base64.b64decode(signature_b64)
-        signature_file = upload_bytes_to_drive(
-            filename=f"{file_prefix}_簽收圖像.{ext}",
-            data=signature_bytes,
-            mime_type=signature_mime_type,
+    # 2. 先上傳簽收憑證 HTML
+    try:
+        receipt_html = build_receipt_html(record)
+        receipt_file = upload_bytes_to_drive(
+            filename=f"{file_prefix}_簽收憑證.html",
+            data=receipt_html.encode("utf-8"),
+            mime_type="text/html",
             parent_id=client_folder_id,
         )
-        result["signature_image_url"] = signature_file.get("webViewLink", "")
+        result["receipt_file_url"] = receipt_file.get("webViewLink", "")
+        notes.append("簽收憑證HTML上傳成功")
+    except Exception as exc:
+        notes.append(f"簽收憑證HTML上傳失敗：{short_error(exc)}")
 
-    receipt_html = build_receipt_html(record)
-    receipt_file = upload_bytes_to_drive(
-        filename=f"{file_prefix}_簽收憑證.html",
-        data=receipt_html.encode("utf-8"),
-        mime_type="text/html",
-        parent_id=client_folder_id,
-    )
-    result["receipt_file_url"] = receipt_file.get("webViewLink", "")
+    # 3. 再上傳簽收圖像
+    signature_b64 = str(record.get("signature_png_base64", "") or "")
+    if signature_b64:
+        try:
+            signature_mime_type = get_signature_mime_type(record)
+            ext = "jpg" if signature_mime_type == "image/jpeg" else "png"
+            signature_bytes = base64.b64decode(signature_b64)
+            signature_file = upload_bytes_to_drive(
+                filename=f"{file_prefix}_簽收圖像.{ext}",
+                data=signature_bytes,
+                mime_type=signature_mime_type,
+                parent_id=client_folder_id,
+            )
+            result["signature_image_url"] = signature_file.get("webViewLink", "")
+            notes.append("簽收圖像上傳成功")
+        except Exception as exc:
+            notes.append(f"簽收圖像上傳失敗：{short_error(exc)}")
+    else:
+        notes.append("沒有簽收圖像可上傳")
 
+    if result.get("receipt_file_url") or result.get("signature_image_url"):
+        notes.append("公司/帳務聯至少部分保存成功")
+    else:
+        notes.append("公司/帳務聯檔案未成功保存；請依前方錯誤原因處理")
+
+    result["archive_note"] = "；".join(notes)
     return result
 
 
@@ -772,6 +806,7 @@ def admin_dashboard_tab():
                 "月結狀態": r.get("billing_status", ""),
                 "簽收憑證": r.get("receipt_file_url", ""),
                 "簽收圖像": r.get("signature_image_url", ""),
+                "歸檔狀態": r.get("archive_note", ""),
                 "備註": r.get("note", ""),
                 "簽收連結": r.get("sign_url", ""),
             }
@@ -1147,7 +1182,7 @@ def customer_signing_page(token: str):
                 drive_result = save_company_accounting_copy_to_drive(record)
                 record.update(drive_result)
             except Exception as exc:
-                record["archive_note"] = f"Google Drive 自動保存失敗：{type(exc).__name__}"
+                record["archive_note"] = f"Google Drive 自動保存失敗：{short_error(exc)}"
                 st.warning("簽收已完成，但公司/帳務聯自動保存到 Google Drive 時發生問題；請通知新豐製版確認後台紀錄。")
 
             update_record(row_number, record)
