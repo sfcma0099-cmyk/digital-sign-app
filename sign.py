@@ -37,6 +37,7 @@ from streamlit_drawable_canvas import st_canvas
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 
 POPULAR_CLIENTS = ["禎曜", "金森", "三和", "合歷", "佳鑫", "紙城", "易昇", "榮星"]
+POPULAR_SALES_REPS = ["偉智", "郁航"]
 
 HEADERS = [
     "token",
@@ -61,6 +62,7 @@ HEADERS = [
     "billing_month",
     "billing_status",
     "archive_note",
+    "sales_rep",
 ]
 
 STATUS_PENDING = "未簽收"
@@ -631,6 +633,7 @@ def make_empty_record(
     quantity: str,
     delivery_date: str,
     note: str,
+    sales_rep: str = "",
 ) -> dict:
     token = generate_token()
     sign_url = build_sign_url(token)
@@ -658,6 +661,7 @@ def make_empty_record(
         "billing_month": delivery_date[:7] if delivery_date else "",
         "billing_status": "未結帳",
         "archive_note": "",
+        "sales_rep": sales_rep.strip(),
     }
 
 
@@ -679,6 +683,20 @@ def admin_create_single_tab():
     product_name = st.text_input("出貨品名 / 刀模編號", placeholder="例如：達創-001")
     quantity = st.text_input("數量", placeholder="例如：1片 / 2組，可留空")
     delivery_date = st.date_input("出貨日期").strftime("%Y-%m-%d")
+
+    sales_rep_type = st.radio(
+        "業務輸入方式",
+        ["從常用清單選擇", "手動自行輸入", "不填寫"],
+        horizontal=True,
+        key="single_sales_rep_type",
+    )
+    if sales_rep_type == "從常用清單選擇":
+        sales_rep = st.selectbox("業務", POPULAR_SALES_REPS, key="single_sales_rep_select")
+    elif sales_rep_type == "手動自行輸入":
+        sales_rep = st.text_input("業務", placeholder="例如：偉智", key="single_sales_rep_text")
+    else:
+        sales_rep = ""
+
     note = st.text_area("備註", placeholder="例如：早班配送、交給王先生，可留空")
 
     if st.button("建立簽收單並產生網址", type="primary"):
@@ -686,17 +704,21 @@ def admin_create_single_tab():
             st.warning("請至少填寫「客戶名稱」與「出貨品名 / 刀模編號」。")
             return
 
-        record = make_empty_record(client_name, product_name, quantity, delivery_date, note)
+        record = make_empty_record(client_name, product_name, quantity, delivery_date, note, sales_rep)
         append_record(record)
 
         st.success("已建立簽收單。")
         st.write("### 給客戶的簽收連結")
         st.code(record["sign_url"], language="text")
 
+        sales_rep_line = f"業務：{record['sales_rep']}\n" if record.get("sales_rep") else ""
+        quantity_line = f"數量：{record['quantity']}\n" if record.get("quantity") else ""
         line_text = (
             f"【新豐製版簽收通知】\n"
             f"客戶：{record['client_name']}\n"
             f"品名/單號：{record['product_name']}\n"
+            f"{quantity_line}"
+            f"{sales_rep_line}"
             f"請您收到版後，開啟以下連結完成簽收：\n"
             f"{record['sign_url']}"
         )
@@ -711,7 +733,12 @@ def parse_batch_line(line: str):
     客戶, 品名
     客戶, 品名, 數量
     客戶, 品名, 數量, 備註
+    客戶, 品名, 數量, 業務, 備註
     也支援中文逗號。
+
+    相容舊格式：
+    - 4 欄時第 4 欄仍視為備註。
+    - 5 欄以上時第 4 欄視為業務，第 5 欄以後視為備註。
     """
     line = line.strip().replace("，", ",")
     if not line:
@@ -724,21 +751,34 @@ def parse_batch_line(line: str):
     client_name = parts[0]
     product_name = parts[1]
     quantity = parts[2] if len(parts) >= 3 else ""
-    note = ",".join(parts[3:]).strip() if len(parts) >= 4 else ""
+
+    sales_rep = ""
+    if len(parts) >= 5:
+        sales_rep = parts[3]
+        note = ",".join(parts[4:]).strip()
+    else:
+        note = ",".join(parts[3:]).strip() if len(parts) >= 4 else ""
 
     if not client_name or not product_name:
         raise ValueError("客戶名稱或品名不可空白")
 
-    return client_name, product_name, quantity, note
+    return client_name, product_name, quantity, note, sales_rep
 
 
 def admin_batch_tab():
     st.subheader("🚀 批量建立簽收單")
-    st.info("每一行代表一張簽收單。格式：客戶名稱, 品名單號, 數量, 備註。後兩欄可省略，也支援中文逗號。")
+    st.info("每一行代表一張簽收單。格式：客戶名稱, 品名單號, 數量, 業務, 備註。數量、業務、備註可視情況省略，也支援中文逗號。")
 
-    default_text = "禎曜, 達創-001, 1片, 早班配送\n金森, 刀模-002\n三和, 紙盒-003, 2組"
+    default_text = "禎曜, 達創-001, 1片, 偉智, 早班配送\n金森, 刀模-002\n三和, 紙盒-003, 2組"
     batch_input = st.text_area("貼上今日派單資料", value=default_text, height=220)
     delivery_date = st.date_input("這批資料的出貨日期", key="batch_delivery_date").strftime("%Y-%m-%d")
+    default_sales_rep = st.selectbox(
+        "這批資料的預設業務",
+        [""] + POPULAR_SALES_REPS,
+        format_func=lambda x: "不填寫" if x == "" else x,
+        key="batch_default_sales_rep",
+    )
+    st.caption("若單行有填業務，會優先使用單行業務；否則使用這批預設業務。")
 
     if st.button("一鍵建立全部簽收單", type="primary"):
         lines = batch_input.splitlines()
@@ -754,8 +794,9 @@ def admin_batch_tab():
                 if parsed is None:
                     continue
 
-                client_name, product_name, quantity, note = parsed
-                record = make_empty_record(client_name, product_name, quantity, delivery_date, note)
+                client_name, product_name, quantity, note, line_sales_rep = parsed
+                sales_rep = line_sales_rep or default_sales_rep
+                record = make_empty_record(client_name, product_name, quantity, delivery_date, note, sales_rep)
                 append_record(record)
                 created_records.append(record)
 
@@ -767,8 +808,12 @@ def admin_batch_tab():
 
             all_links_text = ""
             for record in created_records:
+                quantity_line = f"數量：{record.get('quantity', '')}\n" if record.get("quantity") else ""
+                sales_rep_line = f"業務：{record.get('sales_rep', '')}\n" if record.get("sales_rep") else ""
                 all_links_text += (
                     f"【{record['client_name']}】 {record['product_name']}\n"
+                    f"{quantity_line}"
+                    f"{sales_rep_line}"
                     f"請收到版後開啟簽收：{record['sign_url']}\n\n"
                 )
 
@@ -791,7 +836,7 @@ def admin_dashboard_tab():
         return
 
     status_filter = st.selectbox("狀態篩選", ["全部", STATUS_PENDING, STATUS_SIGNED])
-    keyword = st.text_input("搜尋客戶 / 品名 / 簽收人", placeholder="可留空")
+    keyword = st.text_input("搜尋客戶 / 品名 / 業務", placeholder="可留空")
 
     visible_records = []
     for record in records:
@@ -803,6 +848,7 @@ def admin_dashboard_tab():
                 str(record.get("client_name", "")),
                 str(record.get("product_name", "")),
                 str(record.get("signer_name", "")),
+                str(record.get("sales_rep", "")),
                 str(record.get("note", "")),
             ]
         )
@@ -829,6 +875,7 @@ def admin_dashboard_tab():
                 "客戶": r.get("client_name", ""),
                 "品名/單號": r.get("product_name", ""),
                 "數量": r.get("quantity", ""),
+                "業務": r.get("sales_rep", ""),
                 "簽收時間": r.get("signed_at", ""),
                 "簽收方式": get_signature_method_label(r) if r.get("status") == STATUS_SIGNED else "",
                 "月結狀態": r.get("billing_status", ""),
@@ -868,7 +915,8 @@ def admin_dashboard_tab():
 
     st.write(f"**客戶：** {selected.get('client_name', '')}")
     st.write(f"**品名/單號：** {selected.get('product_name', '')}")
-    st.write(f"**簽收人：** {selected.get('signer_name', '')}")
+    st.write(f"**業務：** {selected.get('sales_rep', '')}")
+    st.write(f"**簽收方式：** {get_signature_method_label(selected)}")
     st.write(f"**簽收時間：** {selected.get('signed_at', '')}")
     show_signature_from_base64(str(selected.get("signature_png_base64", "")))
 
@@ -899,6 +947,7 @@ def build_receipt_html(record: dict) -> str:
     quantity = html.escape(str(record.get("quantity", "")))
     delivery_date = html.escape(str(record.get("delivery_date", "")))
     note = html.escape(str(record.get("note", "")))
+    sales_rep = html.escape(str(record.get("sales_rep", "")))
     signed_at = html.escape(str(record.get("signed_at", "")))
     signer_name = html.escape(str(record.get("signer_name", "")))
     signer_phone = html.escape(str(record.get("signer_phone", "")))
@@ -1003,7 +1052,8 @@ th {{
         <tr><th>品名 / 刀模編號</th><td>{product_name}</td></tr>
         <tr><th>數量</th><td>{quantity}</td></tr>
         <tr><th>出貨日期</th><td>{delivery_date}</td></tr>
-        <tr><th>廠內備註</th><td>{note}</td></tr>
+        <tr><th>業務</th><td>{sales_rep}</td></tr>
+        <tr><th>備註</th><td>{note}</td></tr>
         <tr><th>簽收時間</th><td>{signed_at}</td></tr>
         <tr><th>簽收方式</th><td>{signature_method}</td></tr>
         <tr><th>電話 / 分機</th><td>{signer_phone}</td></tr>
@@ -1044,6 +1094,8 @@ def show_customer_receipt(record: dict):
             st.write(f"**數量：** {record.get('quantity', '')}")
         if record.get("delivery_date", ""):
             st.write(f"**出貨日期：** {record.get('delivery_date', '')}")
+        if record.get("sales_rep", ""):
+            st.write(f"**業務：** {record.get('sales_rep', '')}")
         st.write(f"**簽收時間：** {record.get('signed_at', '')}")
         st.write(f"**簽收方式：** {get_signature_method_label(record)}")
         if record.get("signer_phone", ""):
@@ -1089,6 +1141,8 @@ def customer_signing_page(token: str):
             st.write(f"**數量：** {record.get('quantity', '')}")
         if record.get("delivery_date", ""):
             st.write(f"**出貨日期：** {record.get('delivery_date', '')}")
+        if record.get("sales_rep", ""):
+            st.write(f"**業務：** {record.get('sales_rep', '')}")
         if record.get("note", ""):
             st.write(f"**備註：** {record.get('note', '')}")
 
