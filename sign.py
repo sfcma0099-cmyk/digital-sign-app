@@ -936,12 +936,13 @@ def safe_filename_text(text: str) -> str:
     return result[:60] or "receipt"
 
 
+
 def build_receipt_html(record: dict) -> str:
-    """
-    建立客戶可下載留底的 HTML 簽收憑證。
-    HTML 比 PDF 更適合第一版：手機、電腦都能直接開，也能用瀏覽器另存 PDF。
-    """
-    company_name = "新豐製版"
+    # 建立客戶可下載留底的 HTML 簽收憑證。
+    # v1.11：改成更接近正式出貨簽收憑證的 A4 版面。
+    company_name = "新豐製版企業有限公司"
+    certificate_title = "數位出貨簽收憑證"
+
     client_name = html.escape(str(record.get("client_name", "")))
     product_name = html.escape(str(record.get("product_name", "")))
     quantity = html.escape(str(record.get("quantity", "")))
@@ -949,8 +950,6 @@ def build_receipt_html(record: dict) -> str:
     note = html.escape(str(record.get("note", "")))
     sales_rep = html.escape(str(record.get("sales_rep", "")))
     signed_at = html.escape(str(record.get("signed_at", "")))
-    signer_name = html.escape(str(record.get("signer_name", "")))
-    signer_phone = html.escape(str(record.get("signer_phone", "")))
     signer_note = html.escape(str(record.get("signer_note", "")))
     token = html.escape(str(record.get("token", "")))
     sign_url = html.escape(str(record.get("sign_url", "")))
@@ -958,7 +957,10 @@ def build_receipt_html(record: dict) -> str:
     signature_mime_type = html.escape(get_signature_mime_type(record))
     signature_method = html.escape(get_signature_method_label(record))
 
-    signature_html = ""
+    shipment_note = note if note else "無"
+    receipt_note = signer_note if signer_note else "無"
+
+    signature_html = '<div class="empty-signature">未附簽收圖像</div>'
     if signature_b64:
         signature_html = f'<img class="signature" src="data:{signature_mime_type};base64,{signature_b64}" alt="簽收圖像">'
 
@@ -967,116 +969,241 @@ def build_receipt_html(record: dict) -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{company_name}｜簽收憑證</title>
+<title>{company_name}｜{certificate_title}</title>
 <style>
+* {{
+    box-sizing: border-box;
+}}
 body {{
     font-family: -apple-system, BlinkMacSystemFont, "Noto Sans TC", "Microsoft JhengHei", Arial, sans-serif;
-    background: #f6f7f9;
-    color: #222;
+    background: #f2f3f5;
+    color: #202124;
     margin: 0;
     padding: 24px;
 }}
-.receipt {{
-    max-width: 760px;
+.page {{
+    width: 210mm;
+    min-height: 297mm;
     margin: 0 auto;
     background: #fff;
-    border: 1px solid #ddd;
-    border-radius: 16px;
-    padding: 28px;
+    padding: 16mm 15mm;
+    border: 1px solid #d8d8d8;
 }}
-h1 {{
-    margin: 0 0 8px;
-    font-size: 28px;
+.header {{
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    border-bottom: 3px solid #202124;
+    padding-bottom: 10px;
+    margin-bottom: 12px;
 }}
-.subtitle {{
-    color: #666;
-    margin-bottom: 24px;
+.company {{
+    font-size: 27px;
+    font-weight: 800;
+    letter-spacing: 1px;
 }}
-.status {{
-    display: inline-block;
-    background: #e8f7ee;
-    color: #126b34;
-    border: 1px solid #b9e5c9;
-    border-radius: 999px;
-    padding: 6px 12px;
+.title {{
+    font-size: 19px;
     font-weight: 700;
-    margin-bottom: 18px;
+    margin-top: 6px;
 }}
-table {{
-    width: 100%;
-    border-collapse: collapse;
-    margin-top: 12px;
+.badge {{
+    border: 2px solid #1f7a3f;
+    color: #1f7a3f;
+    border-radius: 10px;
+    padding: 8px 14px;
+    font-weight: 800;
+    font-size: 18px;
+    white-space: nowrap;
 }}
-th, td {{
-    text-align: left;
-    border-bottom: 1px solid #eee;
-    padding: 12px 8px;
-    vertical-align: top;
+.section-title {{
+    font-size: 16px;
+    font-weight: 800;
+    margin: 16px 0 8px;
+    padding-left: 8px;
+    border-left: 5px solid #202124;
 }}
-th {{
-    width: 160px;
-    color: #555;
-    font-weight: 700;
+.grid {{
+    display: grid;
+    grid-template-columns: 34mm 1fr 34mm 1fr;
+    border-top: 1px solid #bdbdbd;
+    border-left: 1px solid #bdbdbd;
 }}
-.signature-box {{
-    margin-top: 24px;
-    border: 1px dashed #aaa;
-    border-radius: 12px;
-    padding: 16px;
-    min-height: 120px;
+.label, .value {{
+    border-right: 1px solid #bdbdbd;
+    border-bottom: 1px solid #bdbdbd;
+    padding: 8px 9px;
+    min-height: 36px;
+    line-height: 1.45;
+}}
+.label {{
+    background: #f6f7f9;
+    font-weight: 800;
+    color: #333;
+}}
+.value {{
+    font-weight: 600;
+    word-break: break-word;
+}}
+.note-box {{
+    border: 1px solid #bdbdbd;
+    padding: 10px;
+    min-height: 42px;
+    line-height: 1.5;
+    word-break: break-word;
+}}
+.signature-panel {{
+    border: 1px solid #777;
+    min-height: 70mm;
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    page-break-inside: avoid;
+}}
+.signature-title {{
+    font-weight: 800;
+    font-size: 15px;
+    margin-bottom: 8px;
+}}
+.signature-area {{
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 48mm;
 }}
 .signature {{
     max-width: 100%;
-    max-height: 220px;
+    max-height: 48mm;
+    object-fit: contain;
+}}
+.empty-signature {{
+    color: #888;
+    border: 1px dashed #aaa;
+    padding: 24px;
+    width: 100%;
+    text-align: center;
+}}
+.signature-caption {{
+    text-align: center;
+    color: #666;
+    font-size: 12px;
+    border-top: 1px solid #ddd;
+    padding-top: 8px;
+}}
+.system-info {{
+    font-size: 11px;
+    color: #555;
+    line-height: 1.55;
+    word-break: break-all;
 }}
 .footer {{
-    margin-top: 24px;
-    color: #777;
-    font-size: 13px;
+    margin-top: 14px;
+    font-size: 12px;
+    color: #555;
     line-height: 1.6;
+    border-top: 1px solid #ddd;
+    padding-top: 10px;
+}}
+.print-hint {{
+    max-width: 210mm;
+    margin: 10px auto 0;
+    color: #666;
+    font-size: 13px;
+}}
+@page {{
+    size: A4;
+    margin: 10mm;
 }}
 @media print {{
-    body {{ background: #fff; padding: 0; }}
-    .receipt {{ border: none; border-radius: 0; }}
+    body {{
+        background: #fff;
+        padding: 0;
+    }}
+    .page {{
+        width: auto;
+        min-height: auto;
+        margin: 0;
+        padding: 0;
+        border: none;
+    }}
+    .print-hint {{
+        display: none;
+    }}
+    .header, .grid, .signature-panel, .footer {{
+        page-break-inside: avoid;
+    }}
 }}
 </style>
 </head>
 <body>
-<div class="receipt">
-    <h1>{company_name}｜簽收憑證</h1>
-    <div class="subtitle">此憑證由數位簽收系統產生，供客戶與廠內雙方留存。</div>
-    <div class="status">已簽收</div>
+<div class="page">
+    <div class="header">
+        <div>
+            <div class="company">{company_name}</div>
+            <div class="title">{certificate_title}</div>
+        </div>
+        <div class="badge">已簽收</div>
+    </div>
 
-    <table>
-        <tr><th>客戶名稱</th><td>{client_name}</td></tr>
-        <tr><th>品名 / 刀模編號</th><td>{product_name}</td></tr>
-        <tr><th>數量</th><td>{quantity}</td></tr>
-        <tr><th>出貨日期</th><td>{delivery_date}</td></tr>
-        <tr><th>業務</th><td>{sales_rep}</td></tr>
-        <tr><th>備註</th><td>{note}</td></tr>
-        <tr><th>簽收時間</th><td>{signed_at}</td></tr>
-        <tr><th>簽收方式</th><td>{signature_method}</td></tr>
-        <tr><th>電話 / 分機</th><td>{signer_phone}</td></tr>
-        <tr><th>簽收備註</th><td>{signer_note}</td></tr>
-        <tr><th>簽收單號</th><td>{token}</td></tr>
-        <tr><th>原簽收網址</th><td>{sign_url}</td></tr>
-    </table>
+    <div class="section-title">一、出貨資料</div>
+    <div class="grid">
+        <div class="label">客戶名稱</div>
+        <div class="value">{client_name}</div>
+        <div class="label">出貨日期</div>
+        <div class="value">{delivery_date}</div>
 
-    <div class="signature-box">
-        <strong>簽名：</strong><br>
-        {signature_html}
+        <div class="label">品名 / 刀模編號</div>
+        <div class="value">{product_name}</div>
+        <div class="label">數量</div>
+        <div class="value">{quantity}</div>
+
+        <div class="label">業務</div>
+        <div class="value">{sales_rep}</div>
+        <div class="label">簽收方式</div>
+        <div class="value">{signature_method}</div>
+    </div>
+
+    <div class="section-title">二、簽收資料</div>
+    <div class="grid">
+        <div class="label">簽收時間</div>
+        <div class="value">{signed_at}</div>
+        <div class="label">簽收單號</div>
+        <div class="value">{token}</div>
+    </div>
+
+    <div class="section-title">三、備註</div>
+    <div class="note-box">
+        <strong>出貨備註：</strong>{shipment_note}<br>
+        <strong>簽收備註：</strong>{receipt_note}
+    </div>
+
+    <div class="section-title">四、簽收圖像</div>
+    <div class="signature-panel">
+        <div>
+            <div class="signature-title">客戶簽名 / 簽章</div>
+            <div class="signature-area">{signature_html}</div>
+        </div>
+        <div class="signature-caption">本簽收圖像由客戶於數位簽收頁面完成，作為本筆出貨簽收紀錄。</div>
+    </div>
+
+    <div class="section-title">五、系統留存資訊</div>
+    <div class="system-info">
+        原簽收網址：{sign_url}<br>
+        本憑證由新豐製版數位簽收系統產生，供客戶與公司帳務留存。若內容有疑問，請聯絡新豐製版確認。
     </div>
 
     <div class="footer">
-        建議客戶下載此 HTML 檔留存；也可用瀏覽器的列印功能另存為 PDF。<br>
-        若內容有疑問，請聯絡新豐製版確認。
+        客戶可下載此憑證留存；公司端同步保存公司 / 帳務聯至 Google Drive，並於 Google Sheet 建立月結台帳。
     </div>
 </div>
+<div class="print-hint">提示：若需 PDF，可使用瀏覽器列印功能，紙張選 A4，邊界選預設或最小。</div>
 </body>
 </html>'''
 
 
 def build_receipt_download_filename(record: dict) -> str:
+
     client = safe_filename_text(record.get("client_name", ""))
     product = safe_filename_text(record.get("product_name", ""))
     signed_at = safe_filename_text(str(record.get("signed_at", "")).replace(":", "").replace("-", ""))
@@ -1087,7 +1214,7 @@ def show_customer_receipt(record: dict):
     st.success("此單已完成簽收。以下資料可供客戶留底。")
 
     with st.container(border=True):
-        st.write("### 📄 簽收憑證")
+        st.write("### 📄 數位出貨簽收憑證")
         st.write(f"**客戶名稱：** {record.get('client_name', '')}")
         st.write(f"**品名 / 刀模編號：** {record.get('product_name', '')}")
         if record.get("quantity", ""):
