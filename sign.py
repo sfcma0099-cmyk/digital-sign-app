@@ -1243,6 +1243,26 @@ def show_customer_receipt(record: dict):
         help="下載後可直接打開，也可用瀏覽器列印成 PDF。",
     )
 
+    receipt_file_url = str(record.get("receipt_file_url", "") or "").strip()
+    if receipt_file_url:
+        st.write("### 🔗 客戶留存 / 會計對帳連結")
+        st.link_button("開啟雲端簽收憑證", receipt_file_url)
+
+        accounting_text = (
+            f"【新豐製版簽收憑證】\\n"
+            f"客戶：{record.get('client_name', '')}\\n"
+            f"品名/單號：{record.get('product_name', '')}\\n"
+            f"數量：{record.get('quantity', '')}\\n"
+            f"出貨日期：{record.get('delivery_date', '')}\\n"
+            f"業務：{record.get('sales_rep', '')}\\n"
+            f"簽收時間：{record.get('signed_at', '')}\\n"
+            f"雲端憑證：{receipt_file_url}"
+        )
+        st.caption("可複製下方文字轉給客戶會計或採購留存。")
+        st.code(accounting_text, language="text")
+    else:
+        st.info("雲端簽收憑證連結尚未產生；客戶可先下載上方 HTML 憑證留存，或保留此簽收網址日後查詢。")
+
     st.info("客戶也可以保留這個簽收網址；日後再次開啟同一連結，會看到已簽收紀錄，不會重複簽收。")
 
 # ---------- 客戶端：簽收頁 ----------
