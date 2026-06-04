@@ -9,7 +9,7 @@ import urllib.parse
 import urllib.request
 import urllib.error
 from datetime import datetime
-from io import BytesIO
+from io import BytesIO, StringIO
 from zoneinfo import ZoneInfo
 
 import gspread
@@ -23,7 +23,7 @@ from streamlit_drawable_canvas import st_canvas
 
 
 # =========================================================
-# 新豐製版：Token 版數位簽收系統 v1
+# 新豐製版：Token 版數位簽收系統 v1.14
 # ---------------------------------------------------------
 # 這支 app.py 同時包含：
 # 1) 廠內端：建立簽收單、批量建立連結、查詢簽收狀態
@@ -63,6 +63,7 @@ HEADERS = [
     "billing_status",
     "archive_note",
     "sales_rep",
+    "billing_settled_at",
 ]
 
 STATUS_PENDING = "未簽收"
@@ -225,11 +226,10 @@ def today_text() -> str:
     return datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
 
 
-def get_all_records():
+def get_all_records_with_row_numbers():
     """
-    讀取 Google Sheet 全部資料。
-    不使用 gspread 的 get_all_records()，避免第一列標題有重複、空白或舊欄位時直接報錯。
-    固定用程式內建 HEADERS 當欄位標準，比較適合 MVP 持續升級。
+    讀取 Google Sheet 全部資料，並保留實際列號。
+    v1.14 月底結帳需要正確更新指定列，所以這裡回傳 (row_number, record)。
     """
     ws = get_worksheet()
     ensure_headers(ws)
@@ -239,7 +239,7 @@ def get_all_records():
         return []
 
     records = []
-    for row in values[1:]:
+    for row_number, row in enumerate(values[1:], start=2):
         if not any(str(cell).strip() for cell in row):
             continue
 
@@ -247,14 +247,22 @@ def get_all_records():
         record = {}
         for index, header in enumerate(HEADERS):
             record[header] = padded_row[index] if index < len(padded_row) else ""
-        records.append(record)
+        records.append((row_number, record))
 
     return records
 
 
+def get_all_records():
+    """
+    讀取 Google Sheet 全部資料。
+    不使用 gspread 的 get_all_records()，避免第一列標題有重複、空白或舊欄位時直接報錯。
+    固定用程式內建 HEADERS 當欄位標準，比較適合 MVP 持續升級。
+    """
+    return [record for _, record in get_all_records_with_row_numbers()]
+
+
 def find_record_by_token(token: str):
-    records = get_all_records()
-    for row_number, record in enumerate(records, start=2):
+    for row_number, record in get_all_records_with_row_numbers():
         if str(record.get("token", "")).strip() == token:
             return row_number, record
     return None, None
@@ -662,6 +670,7 @@ def make_empty_record(
         "billing_status": "未結帳",
         "archive_note": "",
         "sales_rep": sales_rep.strip(),
+        "billing_settled_at": "",
     }
 
 
@@ -920,6 +929,226 @@ def admin_dashboard_tab():
     st.write(f"**簽收時間：** {selected.get('signed_at', '')}")
     show_signature_from_base64(str(selected.get("signature_png_base64", "")))
 
+
+
+
+# ---------- 廠內端：月底結帳 ----------
+def normalize_billing_status(record: dict) -> str:
+    status = str(record.get("billing_status", "") or "").strip()
+    return status or "未結帳"
+
+
+def normalize_record_billing_month(record: dict) -> str:
+    month_text = str(record.get("billing_month", "") or "").strip()
+    if len(month_text) >= 7:
+        return month_text[:7]
+    return month_from_record(record)
+
+
+def build_billing_csv(records: list) -> bytes:
+    """產生可用 Excel 開啟的 UTF-8 BOM CSV 月結清單。"""
+    output = StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=[
+            "月份",
+            "月結狀態",
+            "月結時間",
+            "客戶",
+            "品名/單號",
+            "數量",
+            "出貨日期",
+            "業務",
+            "簽收時間",
+            "簽收方式",
+            "雲端憑證連結",
+            "簽收圖像連結",
+            "出貨備註",
+            "簽收備註",
+            "token",
+        ],
+    )
+    writer.writeheader()
+
+    for record in records:
+        writer.writerow(
+            {
+                "月份": normalize_record_billing_month(record),
+                "月結狀態": normalize_billing_status(record),
+                "月結時間": record.get("billing_settled_at", ""),
+                "客戶": record.get("client_name", ""),
+                "品名/單號": record.get("product_name", ""),
+                "數量": record.get("quantity", ""),
+                "出貨日期": record.get("delivery_date", ""),
+                "業務": record.get("sales_rep", ""),
+                "簽收時間": record.get("signed_at", ""),
+                "簽收方式": get_signature_method_label(record),
+                "雲端憑證連結": record.get("receipt_file_url", ""),
+                "簽收圖像連結": record.get("signature_image_url", ""),
+                "出貨備註": record.get("note", ""),
+                "簽收備註": record.get("signer_note", ""),
+                "token": record.get("token", ""),
+            }
+        )
+
+    return ("\ufeff" + output.getvalue()).encode("utf-8")
+
+
+def admin_billing_tab():
+    st.subheader("💰 月底結帳管理")
+    st.caption("v1.14：依客戶、月份、月結狀態篩選已簽收資料，匯出月結清單，並可一鍵標記已結帳。")
+
+    records_with_rows = get_all_records_with_row_numbers()
+    signed_records_with_rows = [
+        (row_number, record)
+        for row_number, record in records_with_rows
+        if record.get("status") == STATUS_SIGNED
+    ]
+
+    if not signed_records_with_rows:
+        st.info("目前還沒有已簽收資料可進行月底結帳。")
+        return
+
+    months = sorted(
+        {normalize_record_billing_month(record) for _, record in signed_records_with_rows if normalize_record_billing_month(record)},
+        reverse=True,
+    )
+    clients = sorted(
+        {str(record.get("client_name", "") or "").strip() for _, record in signed_records_with_rows if str(record.get("client_name", "") or "").strip()}
+    )
+
+    current_month = datetime.now(TAIPEI_TZ).strftime("%Y-%m")
+    default_month_index = months.index(current_month) + 1 if current_month in months else 0
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        selected_month = st.selectbox("月份", ["全部"] + months, index=default_month_index)
+    with col2:
+        selected_client = st.selectbox("客戶", ["全部"] + clients)
+    with col3:
+        selected_billing_status = st.selectbox("月結狀態", ["未結帳", "已結帳", "全部"])
+
+    keyword = st.text_input("搜尋品名 / 單號 / 業務 / 備註", placeholder="可留空")
+
+    filtered_with_rows = []
+    for row_number, record in signed_records_with_rows:
+        record_month = normalize_record_billing_month(record)
+        record_client = str(record.get("client_name", "") or "").strip()
+        record_billing_status = normalize_billing_status(record)
+
+        if selected_month != "全部" and record_month != selected_month:
+            continue
+        if selected_client != "全部" and record_client != selected_client:
+            continue
+        if selected_billing_status != "全部" and record_billing_status != selected_billing_status:
+            continue
+
+        haystack = " ".join(
+            [
+                str(record.get("client_name", "")),
+                str(record.get("product_name", "")),
+                str(record.get("quantity", "")),
+                str(record.get("sales_rep", "")),
+                str(record.get("note", "")),
+                str(record.get("signer_note", "")),
+            ]
+        )
+        if keyword.strip() and keyword.strip() not in haystack:
+            continue
+
+        filtered_with_rows.append((row_number, record))
+
+    filtered_records = [record for _, record in filtered_with_rows]
+    unsigned_count = sum(1 for _, record in records_with_rows if record.get("status") == STATUS_PENDING)
+    signed_count = len(signed_records_with_rows)
+    unsettled_count = sum(1 for _, record in signed_records_with_rows if normalize_billing_status(record) == "未結帳")
+    filtered_quantity = len(filtered_records)
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("已簽收總筆數", signed_count)
+    col2.metric("未結帳", unsettled_count)
+    col3.metric("目前篩選", filtered_quantity)
+    col4.metric("未簽收", unsigned_count)
+
+    if not filtered_records:
+        st.info("目前篩選條件沒有符合的資料。")
+        return
+
+    display_rows = []
+    for record in filtered_records:
+        display_rows.append(
+            {
+                "月份": normalize_record_billing_month(record),
+                "月結狀態": normalize_billing_status(record),
+                "月結時間": record.get("billing_settled_at", ""),
+                "客戶": record.get("client_name", ""),
+                "品名/單號": record.get("product_name", ""),
+                "數量": record.get("quantity", ""),
+                "出貨日期": record.get("delivery_date", ""),
+                "業務": record.get("sales_rep", ""),
+                "簽收時間": record.get("signed_at", ""),
+                "簽收方式": get_signature_method_label(record),
+                "雲端憑證": record.get("receipt_file_url", ""),
+                "簽收圖像": record.get("signature_image_url", ""),
+                "備註": record.get("note", ""),
+            }
+        )
+
+    st.dataframe(
+        display_rows,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "雲端憑證": st.column_config.LinkColumn("雲端憑證"),
+            "簽收圖像": st.column_config.LinkColumn("簽收圖像"),
+        },
+    )
+
+    export_month = selected_month if selected_month != "全部" else "全部月份"
+    export_client = safe_filename_text(selected_client if selected_client != "全部" else "全部客戶")
+    export_status = selected_billing_status
+    export_filename = f"新豐製版_月結簽收清單_{export_month}_{export_client}_{export_status}.csv"
+
+    st.download_button(
+        label="下載目前篩選結果 CSV",
+        data=build_billing_csv(filtered_records),
+        file_name=export_filename,
+        mime="text/csv",
+        help="CSV 可用 Excel 開啟；內容就是目前畫面篩選到的資料。",
+    )
+
+    st.write("---")
+    st.write("### 一鍵標記已結帳")
+    target_with_rows = [
+        (row_number, record)
+        for row_number, record in filtered_with_rows
+        if normalize_billing_status(record) != "已結帳"
+    ]
+
+    if not target_with_rows:
+        st.success("目前篩選結果都已經是已結帳。")
+        return
+
+    st.warning(f"此操作會把目前篩選結果中 {len(target_with_rows)} 筆資料標記為「已結帳」。")
+    confirm_mark_billed = st.checkbox("我確認要將目前篩選結果標記為已結帳", key="confirm_mark_billed")
+
+    if st.button("將目前篩選結果標記為已結帳", type="primary"):
+        if not confirm_mark_billed:
+            st.warning("請先勾選確認。")
+            return
+
+        settled_at = now_text()
+        updated_count = 0
+        with st.spinner("正在更新月結狀態..."):
+            for row_number, record in target_with_rows:
+                record["billing_status"] = "已結帳"
+                record["billing_settled_at"] = settled_at
+                record["billing_month"] = normalize_record_billing_month(record)
+                update_record(row_number, record)
+                updated_count += 1
+
+        st.success(f"已將 {updated_count} 筆資料標記為已結帳。")
+        st.rerun()
 
 
 
@@ -1438,7 +1667,7 @@ def admin_page():
     elif not get_drive_upload_webapp_url() or not get_drive_upload_secret():
         st.warning("尚未設定 DRIVE_UPLOAD_WEBAPP_URL 或 DRIVE_UPLOAD_SECRET；客戶簽收仍可完成，但公司/帳務聯不會自動保存到 Google Drive。")
 
-    tab1, tab2, tab3 = st.tabs(["📝 單筆建立", "🚀 批量建立", "📋 狀態查詢"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📝 單筆建立", "🚀 批量建立", "📋 狀態查詢", "💰 月底結帳"])
 
     with tab1:
         admin_create_single_tab()
@@ -1448,6 +1677,9 @@ def admin_page():
 
     with tab3:
         admin_dashboard_tab()
+
+    with tab4:
+        admin_billing_tab()
 
     st.write("---")
     if st.button("登出管理端"):
