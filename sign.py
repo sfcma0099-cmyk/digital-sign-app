@@ -137,11 +137,11 @@ def show_config_error():
         st.code(
             """
 APP_BASE_URL = "https://你的-app.streamlit.app"
-ADMIN_PASSWORD = "請設定一組廠內管理密碼"
-GOOGLE_SHEET_ID = "你的 Google 試算表 ID"
-GOOGLE_DRIVE_FOLDER_ID = "你的 Google Drive 簽收憑證資料夾 ID"
-DRIVE_UPLOAD_WEBAPP_URL = "你的 Google Apps Script Web App URL"
-DRIVE_UPLOAD_SECRET = "你自己設定的上傳密鑰"
+ADMIN_PASSWORD = "20260604"
+GOOGLE_SHEET_ID = "1QpThDeH1I3kK22D-o4c0cpo8mkarGc7sYKVRpo-Yyck/edit?gid=0#gid=0"
+GOOGLE_DRIVE_FOLDER_ID = "1Qv9WUO0Gu4Yme6VNUsmQNQU7jWBN3md4"
+DRIVE_UPLOAD_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbx2m9lkQnMpmfBTdzq1x2XJ9869ds901TsH035RxMoC9eHwC0_WCBK1C_updzMV3xAhWg/exec"
+DRIVE_UPLOAD_SECRET = "Lee&Laivmpvmp0111"
 
 [gcp_service_account]
 type = "service_account"
