@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 import gspread
 import numpy as np
 import streamlit as st
+import streamlit.components.v1 as components
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
@@ -23,7 +24,7 @@ from streamlit_drawable_canvas import st_canvas
 
 
 # =========================================================
-# 新豐製版：Token 版數位簽收系統 v1.14
+# 新豐製版：Token 版數位簽收系統 v1.16
 # ---------------------------------------------------------
 # 這支 app.py 同時包含：
 # 1) 廠內端：建立簽收單、批量建立連結、查詢簽收狀態
@@ -137,11 +138,11 @@ def show_config_error():
         st.code(
             """
 APP_BASE_URL = "https://你的-app.streamlit.app"
-ADMIN_PASSWORD = "20260604"
-GOOGLE_SHEET_ID = "1QpThDeH1I3kK22D-o4c0cpo8mkarGc7sYKVRpo-Yyck/edit?gid=0#gid=0"
-GOOGLE_DRIVE_FOLDER_ID = "1Qv9WUO0Gu4Yme6VNUsmQNQU7jWBN3md4"
-DRIVE_UPLOAD_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbx2m9lkQnMpmfBTdzq1x2XJ9869ds901TsH035RxMoC9eHwC0_WCBK1C_updzMV3xAhWg/exec"
-DRIVE_UPLOAD_SECRET = "Lee&Laivmpvmp0111"
+ADMIN_PASSWORD = "請設定一組廠內管理密碼"
+GOOGLE_SHEET_ID = "你的 Google 試算表 ID"
+GOOGLE_DRIVE_FOLDER_ID = "你的 Google Drive 簽收憑證資料夾 ID"
+DRIVE_UPLOAD_WEBAPP_URL = "你的 Google Apps Script Web App URL"
+DRIVE_UPLOAD_SECRET = "你自己設定的上傳密鑰"
 
 [gcp_service_account]
 type = "service_account"
@@ -1439,44 +1440,202 @@ def build_receipt_download_filename(record: dict) -> str:
     return f"新豐製版_簽收憑證_{client}_{product}_{signed_at}.html"
 
 
+def build_customer_receipt_preview_html(record: dict) -> str:
+    """客戶端簽完後直接顯示的憑證預覽。v1.15：補回舊版客戶可直接看到的憑證畫面。"""
+    def esc(value):
+        return html.escape(str(value or ""))
+
+    signature_b64 = str(record.get("signature_png_base64", "") or "")
+    signature_mime_type = html.escape(get_signature_mime_type(record))
+    if signature_b64:
+        signature_html = f'<img class="signature-img" src="data:{signature_mime_type};base64,{signature_b64}" alt="簽名 / 簽章">'
+    else:
+        signature_html = '<div class="empty-signature">未附簽收圖像</div>'
+
+    rows = [
+        ("客戶名稱", record.get("client_name", "")),
+        ("品名 / 刀模編號", record.get("product_name", "")),
+        ("數量", record.get("quantity", "")),
+        ("出貨日期", record.get("delivery_date", "")),
+        ("業務", record.get("sales_rep", "")),
+        ("備註", record.get("note", "")),
+        ("簽收時間", record.get("signed_at", "")),
+        ("簽收方式", get_signature_method_label(record)),
+        ("電話 / 分機", record.get("signer_phone", "")),
+        ("簽收備註", record.get("signer_note", "")),
+        ("簽收單號", record.get("token", "")),
+        ("原簽收網址", record.get("sign_url", "")),
+    ]
+    row_html = "".join(
+        f'<tr><th>{esc(label)}</th><td>{esc(value)}</td></tr>'
+        for label, value in rows
+    )
+
+    return f'''<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+* {{ box-sizing: border-box; }}
+body {{
+    margin: 0;
+    padding: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Noto Sans TC", "Microsoft JhengHei", Arial, sans-serif;
+    color: #243042;
+    background: #ffffff;
+}}
+.receipt-card {{
+    border: 1px solid #d8dee9;
+    border-radius: 12px;
+    padding: 22px;
+    background: #ffffff;
+}}
+.top-note {{
+    font-size: 14px;
+    color: #667085;
+    margin-bottom: 18px;
+}}
+.receipt-head {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 16px;
+}}
+.title {{
+    font-size: 22px;
+    font-weight: 800;
+    color: #111827;
+}}
+.badge {{
+    display: inline-block;
+    background: #e8fff1;
+    color: #148447;
+    border: 1px solid #b7ebc9;
+    border-radius: 999px;
+    padding: 7px 14px;
+    font-weight: 800;
+    white-space: nowrap;
+}}
+table {{
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 8px;
+}}
+th, td {{
+    border-bottom: 1px solid #e5e7eb;
+    padding: 11px 8px;
+    text-align: left;
+    vertical-align: top;
+    font-size: 14px;
+    line-height: 1.45;
+}}
+th {{
+    width: 135px;
+    color: #374151;
+    font-weight: 800;
+    white-space: nowrap;
+}}
+td {{
+    color: #111827;
+    word-break: break-word;
+}}
+.signature-box {{
+    border: 1px dashed #aeb7c2;
+    border-radius: 10px;
+    margin-top: 24px;
+    padding: 16px;
+    min-height: 210px;
+}}
+.signature-title {{
+    font-weight: 800;
+    margin-bottom: 12px;
+}}
+.signature-img {{
+    max-width: 220px;
+    max-height: 180px;
+    object-fit: contain;
+}}
+.empty-signature {{
+    color: #8a94a6;
+    padding: 36px;
+    text-align: center;
+}}
+.footer {{
+    margin-top: 16px;
+    color: #667085;
+    font-size: 13px;
+    line-height: 1.7;
+}}
+@media print {{
+    .receipt-card {{ border: none; padding: 0; }}
+}}
+</style>
+</head>
+<body>
+<div class="receipt-card">
+    <div class="top-note">此憑證由數位簽收系統產生，供客戶與廠內雙方留存。</div>
+    <div class="receipt-head">
+        <div class="title">新豐製版｜數位簽收憑證</div>
+        <div class="badge">已簽收</div>
+    </div>
+    <table>{row_html}</table>
+    <div class="signature-box">
+        <div class="signature-title">簽名：</div>
+        {signature_html}
+    </div>
+    <div class="footer">
+        建議客戶下載此 HTML 憑證留存；也可用瀏覽器的列印功能另存為 PDF。<br>
+        若內容有疑問，請聯絡新豐製版確認。
+    </div>
+</div>
+</body>
+</html>'''
+
+
 def show_customer_receipt(record: dict):
-    st.success("此單已完成簽收。以下資料可供客戶留底。")
+    st.success("此單已完成簽收。以下為簽收憑證，可供客戶留底。")
 
-    with st.container(border=True):
-        st.write("### 📄 數位出貨簽收憑證")
-        st.write(f"**客戶名稱：** {record.get('client_name', '')}")
-        st.write(f"**品名 / 刀模編號：** {record.get('product_name', '')}")
-        if record.get("quantity", ""):
-            st.write(f"**數量：** {record.get('quantity', '')}")
-        if record.get("delivery_date", ""):
-            st.write(f"**出貨日期：** {record.get('delivery_date', '')}")
-        if record.get("sales_rep", ""):
-            st.write(f"**業務：** {record.get('sales_rep', '')}")
-        st.write(f"**簽收時間：** {record.get('signed_at', '')}")
-        st.write(f"**簽收方式：** {get_signature_method_label(record)}")
-        if record.get("signer_phone", ""):
-            st.write(f"**電話 / 分機：** {record.get('signer_phone', '')}")
-        if record.get("signer_note", ""):
-            st.write(f"**簽收備註：** {record.get('signer_note', '')}")
+    # v1.16：已簽收後，原簽收連結會變成「憑證查詢 / 下載頁」。
+    # 客戶日後再次開啟同一個簽收網址，不會重複簽收，而是直接看到憑證與下載按鈕。
+    st.info("您可以保存此簽收網址；日後再次開啟同一連結，就可以重新查看或下載簽收憑證。")
 
-        show_signature_from_base64(str(record.get("signature_png_base64", "")))
+    st.write("### 📄 數位簽收憑證")
+    components.html(
+        build_customer_receipt_preview_html(record),
+        height=940,
+        scrolling=True,
+    )
 
     receipt_html = build_receipt_html(record)
     filename = build_receipt_download_filename(record)
+    receipt_file_url = str(record.get("receipt_file_url", "") or "").strip()
+    sign_url = str(record.get("sign_url", "") or "").strip()
 
+    st.write("### ⬇️ 憑證下載 / 日後查詢")
     st.download_button(
         label="下載簽收憑證 HTML",
         data=receipt_html.encode("utf-8"),
         file_name=filename,
         mime="text/html",
         help="下載後可直接打開，也可用瀏覽器列印成 PDF。",
+        key=f"download_receipt_{record.get('token', '')}",
     )
 
-    receipt_file_url = str(record.get("receipt_file_url", "") or "").strip()
     if receipt_file_url:
-        st.write("### 🔗 客戶留存 / 會計對帳連結")
         st.link_button("開啟雲端簽收憑證", receipt_file_url)
+        st.caption("建議可將雲端憑證連結轉給貴公司會計或採購留存。")
+    else:
+        st.info("雲端簽收憑證連結尚未產生；可先下載上方 HTML 憑證留存，或保留此簽收網址日後查詢。")
 
+    if sign_url:
+        st.write("### 🔁 日後重新下載用網址")
+        st.caption("日後若需要重新下載憑證，請再次開啟以下原簽收網址。")
+        st.code(sign_url, language="text")
+
+    if receipt_file_url:
+        st.write("### 🔗 客戶留存 / 會計對帳文字")
         accounting_text = (
             f"【新豐製版簽收憑證】\n"
             f"客戶：{record.get('client_name', '')}\n"
@@ -1487,12 +1646,12 @@ def show_customer_receipt(record: dict):
             f"簽收時間：{record.get('signed_at', '')}\n"
             f"雲端憑證：{receipt_file_url}"
         )
+        if sign_url:
+            accounting_text += f"\n日後查詢/下載：{sign_url}"
         st.caption("可複製下方文字轉給客戶會計或採購留存。")
         st.code(accounting_text, language="text")
-    else:
-        st.info("雲端簽收憑證連結尚未產生；客戶可先下載上方 HTML 憑證留存，或保留此簽收網址日後查詢。")
 
-    st.info("客戶也可以保留這個簽收網址；日後再次開啟同一連結，會看到已簽收紀錄，不會重複簽收。")
+    st.info("此簽收單已鎖定，重新開啟連結只會顯示憑證，不會重複簽收。")
 
 # ---------- 客戶端：簽收頁 ----------
 def customer_signing_page(token: str):
