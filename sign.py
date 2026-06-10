@@ -24,7 +24,7 @@ from streamlit_drawable_canvas import st_canvas
 
 
 # =========================================================
-# 新豐製版：Token 版數位簽收系統 v1.16
+# 新豐製版：Token 版數位簽收系統 v1.17
 # ---------------------------------------------------------
 # 這支 app.py 同時包含：
 # 1) 廠內端：建立簽收單、批量建立連結、查詢簽收狀態
@@ -500,6 +500,29 @@ def save_company_accounting_copy_to_drive(record: dict) -> dict:
         return result
 
 
+def has_cloud_receipt(record: dict) -> bool:
+    """判斷這筆已簽收資料是否已經有 Google Drive 雲端憑證連結。"""
+    return bool(str(record.get("receipt_file_url", "") or "").strip())
+
+
+def backfill_company_accounting_copy(row_number: int, record: dict) -> dict:
+    """
+    v1.17：補存公司/帳務聯。
+    若早期資料或異常資料已簽收但沒有 receipt_file_url，
+    可重新用 Google Sheet 內的簽收資料與簽收圖像產生憑證並上傳到 Drive。
+    """
+    if record.get("status") != STATUS_SIGNED:
+        return record
+
+    if has_cloud_receipt(record):
+        return record
+
+    drive_result = save_company_accounting_copy_to_drive(record)
+    record.update(drive_result)
+    update_record(row_number, record)
+    return record
+
+
 # ---------- 簽名處理 ----------
 def canvas_to_png_base64(image_data) -> str:
     """
@@ -909,6 +932,44 @@ def admin_dashboard_tab():
     )
 
     st.write("---")
+    st.write("### ☁️ 雲端憑證補存")
+    visible_tokens = {str(r.get("token", "")) for r in visible_records}
+    missing_cloud_records = [
+        (row_number, r)
+        for row_number, r in get_all_records_with_row_numbers()
+        if str(r.get("token", "")) in visible_tokens
+        and r.get("status") == STATUS_SIGNED
+        and not has_cloud_receipt(r)
+    ]
+
+    if missing_cloud_records:
+        st.warning(f"目前篩選結果有 {len(missing_cloud_records)} 筆已簽收資料尚未產生 Google Drive 雲端憑證連結。")
+        if st.button("補存目前篩選結果缺少的雲端憑證", type="primary"):
+            success_count = 0
+            fail_count = 0
+            messages = []
+
+            with st.spinner("正在補存雲端憑證到 Google Drive..."):
+                for row_number, missing_record in missing_cloud_records:
+                    updated = backfill_company_accounting_copy(row_number, missing_record)
+                    label = f"{updated.get('client_name', '')}｜{updated.get('product_name', '')}"
+                    if has_cloud_receipt(updated):
+                        success_count += 1
+                        messages.append(f"✅ {label}：補存成功")
+                    else:
+                        fail_count += 1
+                        messages.append(f"⚠️ {label}：{updated.get('archive_note', '補存失敗，請檢查 Apps Script / Secrets 設定')}")
+
+            if success_count:
+                st.success(f"已成功補存 {success_count} 筆雲端憑證。")
+            if fail_count:
+                st.error(f"有 {fail_count} 筆仍未補存成功，請查看下方訊息。")
+            st.code("\n".join(messages), language="text")
+            st.info("補存完成後，請重新整理或切換分頁，再確認『簽收憑證』欄位是否出現連結。")
+    else:
+        st.success("目前篩選結果中的已簽收資料都有雲端憑證連結。")
+
+    st.write("---")
     st.write("### 查看單筆簽名")
     signed_records = [r for r in visible_records if r.get("status") == STATUS_SIGNED]
 
@@ -928,6 +989,12 @@ def admin_dashboard_tab():
     st.write(f"**業務：** {selected.get('sales_rep', '')}")
     st.write(f"**簽收方式：** {get_signature_method_label(selected)}")
     st.write(f"**簽收時間：** {selected.get('signed_at', '')}")
+    if selected.get("receipt_file_url", ""):
+        st.write(f"**雲端憑證：** {selected.get('receipt_file_url', '')}")
+    else:
+        st.warning("這筆資料尚未有雲端憑證連結，可使用上方『雲端憑證補存』工具補存。")
+    if selected.get("archive_note", ""):
+        st.write(f"**歸檔狀態：** {selected.get('archive_note', '')}")
     show_signature_from_base64(str(selected.get("signature_png_base64", "")))
 
 
@@ -1682,6 +1749,15 @@ def customer_signing_page(token: str):
             st.write(f"**備註：** {record.get('note', '')}")
 
     if record.get("status") == STATUS_SIGNED:
+        # v1.17：若這筆舊資料已簽收但尚未有雲端憑證，
+        # 客戶或廠內重新開啟原簽收連結時，系統會自動嘗試補存到 Google Drive。
+        if not has_cloud_receipt(record):
+            with st.spinner("正在確認雲端憑證，若尚未保存會自動補存..."):
+                try:
+                    record = backfill_company_accounting_copy(row_number, record)
+                except Exception as exc:
+                    record["archive_note"] = f"雲端憑證補存失敗：{short_error(exc)}"
+                    update_record(row_number, record)
         show_customer_receipt(record)
         st.stop()
 
