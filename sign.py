@@ -4,6 +4,7 @@ import hashlib
 import html
 import hmac
 import json
+import time
 import secrets
 import urllib.parse
 import urllib.request
@@ -24,7 +25,7 @@ from streamlit_drawable_canvas import st_canvas
 
 
 # =========================================================
-# 新豐製版：Token 版數位簽收系統 v1.18
+# 新豐製版：Token 版數位簽收系統 v1.19
 # ---------------------------------------------------------
 # 這支 app.py 同時包含：
 # 1) 廠內端：建立簽收單、批量建立連結、查詢簽收狀態
@@ -277,7 +278,7 @@ def append_record(record: dict):
 
 def append_record_and_verify(record: dict) -> bool:
     """
-    v1.18：建立簽收單後立即回查 Google Sheet。
+    v1.19：建立簽收單後立即回查 Google Sheet。
     只有確認 token 真的存在台帳，才顯示可傳給客戶的連結，避免「LINE 文字產生了，但 Sheet 沒寫入」的情況。
     """
     append_record(record)
@@ -905,7 +906,7 @@ def split_label_value(line: str):
 
 def parse_legacy_token_blocks(text: str) -> list:
     """
-    v1.18：解析舊 LINE 通知整理資料。
+    v1.19：解析舊 LINE 通知整理資料。
     支援格式：
     token：xxx
     客戶：禎曜
@@ -972,7 +973,7 @@ def validate_legacy_record_data(item: dict) -> list:
 
 def admin_legacy_restore_tab():
     st.subheader("🧯 補登舊簽收連結 / token 復活")
-    st.caption("v1.18：用原本傳給客戶的 token 補回 Google Sheet，讓舊簽收網址重新有效。")
+    st.caption("v1.19：用原本傳給客戶的 token 補回 Google Sheet，讓舊簽收網址重新有效。")
 
     st.warning("token 必須完全照原簽收網址複製；大小寫、0/O、1/l/I 只要不同，原連結就不會復活。建議直接從 LINE 訊息中的網址複製 token。")
 
@@ -1054,7 +1055,7 @@ def admin_legacy_restore_tab():
                     sales_rep=str(item.get("sales_rep", "")),
                     token_override=token,
                 )
-                record["archive_note"] = "v1.18 舊 token 補登；原簽收連結已重新啟用，需客戶重新簽收後才會產生正式憑證。"
+                record["archive_note"] = "v1.19 舊 token 補登；原簽收連結已重新啟用，需客戶重新簽收後才會產生正式憑證。"
 
                 try:
                     if append_record_and_verify(record):
@@ -1076,6 +1077,248 @@ def admin_legacy_restore_tab():
 
         st.code("\n".join(messages), language="text")
         st.info("補登成功後，請用原本客戶簽收網址測試；若畫面出現簽收資料，就代表舊連結已復活。")
+
+
+
+
+# ---------- v1.19：補登舊連結強化版 ----------
+def normalize_legacy_token_value(value: str) -> str:
+    """把使用者貼上的 token 或完整簽收網址整理成真正 token。"""
+    text = str(value or "").strip()
+    # 清掉常見不可見字元與全形空白
+    for ch in ("\ufeff", "\u200b", "\u200c", "\u200d", "\xa0", "　"):
+        text = text.replace(ch, "")
+    text = text.strip().strip('"').strip("'")
+
+    # 支援整段網址：https://.../?token=xxxxx
+    if "token=" in text:
+        try:
+            parsed = urllib.parse.urlparse(text)
+            qs = urllib.parse.parse_qs(parsed.query)
+            if qs.get("token"):
+                return urllib.parse.unquote(str(qs["token"][0])).strip()
+        except Exception:
+            pass
+        try:
+            tail = text.split("token=", 1)[1]
+            tail = tail.split("&", 1)[0]
+            tail = tail.split("#", 1)[0]
+            return urllib.parse.unquote(tail).strip()
+        except Exception:
+            return text
+
+    return text
+
+
+def parse_legacy_token_blocks_v119(text: str) -> list:
+    """
+    v1.19：更耐用的舊 LINE 通知解析。
+    支援：
+    1) token：xxxx
+    2) token：https://.../?token=xxxx
+    3) LINE 複製時網址分成兩行：https://.../? 下一行 token=xxxx
+    """
+    records = []
+    current = {}
+
+    def flush_current():
+        nonlocal current
+        token = normalize_legacy_token_value(current.get("token", ""))
+        if token:
+            current["token"] = token
+        client_name = str(current.get("client_name", "")).strip()
+        product_name = str(current.get("product_name", "")).strip()
+        if token or client_name or product_name:
+            records.append(current)
+        current = {}
+
+    pending_url_prefix = ""
+
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        # LINE 有時會把網址拆成兩行：第一行 https://.../?，第二行 token=xxx
+        if line.startswith("http") and "token=" not in line:
+            pending_url_prefix = line
+            continue
+        if pending_url_prefix and line.startswith("token="):
+            line = pending_url_prefix + line
+            pending_url_prefix = ""
+
+        # 若整行是網址，且含 token=，視為新的 token 區塊
+        if line.startswith("http") and "token=" in line:
+            if current.get("token"):
+                flush_current()
+            current["token"] = normalize_legacy_token_value(line)
+            continue
+
+        # 若整行是 token=xxx，也視為 token
+        if line.startswith("token="):
+            if current.get("token"):
+                flush_current()
+            current["token"] = normalize_legacy_token_value(line)
+            continue
+
+        key, value = split_label_value(line)
+        if not key:
+            continue
+
+        key_compact = key.replace(" ", "").replace("/", "")
+        if key_compact.lower() == "token":
+            if current.get("token"):
+                flush_current()
+            current["token"] = normalize_legacy_token_value(value)
+        elif key_compact in ("客戶", "客戶名稱"):
+            current["client_name"] = value
+        elif key_compact in ("品名單號", "品名刀模編號", "品名"):
+            current["product_name"] = value
+        elif key_compact == "數量":
+            current["quantity"] = value
+        elif key_compact == "出貨日期":
+            current["delivery_date"] = normalize_delivery_date_text(value)
+        elif key_compact == "業務":
+            current["sales_rep"] = value
+        elif key_compact == "備註":
+            current["note"] = value
+
+    flush_current()
+    return records
+
+
+def get_existing_token_set() -> set:
+    return {str(record.get("token", "")).strip() for _, record in get_all_records_with_row_numbers() if str(record.get("token", "")).strip()}
+
+
+def admin_legacy_restore_tab():
+    st.subheader("🧯 補登舊簽收連結 / token 復活")
+    st.caption("v1.19 強化：可貼完整 LINE 簽收網址；系統會自動取出 token，並用批次寫入後逐筆回查。")
+
+    st.info(
+        "用途：把之前已傳給客戶、但沒有成功留在 Google Sheet 台帳的舊簽收連結補回來。"
+        "補登後，舊網址會重新有效；狀態會先是『未簽收』。"
+    )
+
+    legacy_text = st.text_area(
+        "貼上要補登的舊簽收資料",
+        height=360,
+        placeholder=(
+            "token：或直接貼整段簽收網址\n"
+            "客戶：禎曜\n"
+            "品名 / 單號：達創-3512465301\n"
+            "數量：\n"
+            "出貨日期：2026/06/09\n"
+            "業務：笠陽\n"
+            "備註：\n"
+        ),
+    )
+
+    parsed_items = parse_legacy_token_blocks_v119(legacy_text)
+
+    if parsed_items:
+        st.write(f"已解析到 {len(parsed_items)} 筆補登資料。")
+        preview_rows = []
+        for item in parsed_items:
+            preview_rows.append(
+                {
+                    "token": item.get("token", ""),
+                    "客戶": item.get("client_name", ""),
+                    "品名/單號": item.get("product_name", ""),
+                    "數量": item.get("quantity", ""),
+                    "出貨日期": item.get("delivery_date", ""),
+                    "業務": item.get("sales_rep", ""),
+                    "備註": item.get("note", ""),
+                }
+            )
+        st.dataframe(preview_rows, use_container_width=True, hide_index=True)
+        st.warning("請特別確認 token 是否只剩 token 本身，不是整段網址；也請確認 0/O、1/I/l 沒有被手動改到。")
+
+    confirm_restore = st.checkbox("我確認以上 token 皆為原本傳給客戶的簽收網址 token", key="confirm_legacy_restore_v119")
+
+    if st.button("補登並復活舊簽收連結", type="primary"):
+        if not confirm_restore:
+            st.warning("請先勾選確認。")
+            return
+
+        if not parsed_items:
+            st.warning("沒有解析到可補登資料，請確認格式。")
+            return
+
+        existing_tokens = get_existing_token_set()
+        rows_to_append = []
+        append_meta = []
+        messages = []
+        skipped_count = 0
+        fail_count = 0
+
+        for index, item in enumerate(parsed_items, start=1):
+            item = dict(item)
+            item["token"] = normalize_legacy_token_value(item.get("token", ""))
+            errors = validate_legacy_record_data(item)
+            label = f"第 {index} 筆｜{item.get('client_name','')}｜{item.get('product_name','')}"
+            if errors:
+                fail_count += 1
+                messages.append(f"❌ {label}：{'、'.join(errors)}")
+                continue
+
+            token = str(item.get("token", "")).strip()
+            if token in existing_tokens:
+                skipped_count += 1
+                messages.append(f"ℹ️ {label}：token 已存在，略過不重複補登")
+                continue
+
+            delivery_date = normalize_delivery_date_text(item.get("delivery_date", ""))
+            record = make_empty_record(
+                client_name=str(item.get("client_name", "")),
+                product_name=str(item.get("product_name", "")),
+                quantity=str(item.get("quantity", "")),
+                delivery_date=delivery_date,
+                note=str(item.get("note", "")),
+                sales_rep=str(item.get("sales_rep", "")),
+                token_override=token,
+            )
+            record["archive_note"] = "v1.19 舊 token 補登；原簽收連結已重新啟用，需客戶重新簽收後才會產生正式憑證。"
+            rows_to_append.append([record.get(header, "") for header in HEADERS])
+            append_meta.append((label, token, record.get("sign_url", "")))
+            existing_tokens.add(token)
+
+        success_count = 0
+        verify_failed = []
+
+        if rows_to_append:
+            try:
+                ws = get_worksheet()
+                ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
+                # 等 Google Sheets 寫入完成，再回查。最多試 3 次。
+                found_tokens = set()
+                for _ in range(3):
+                    time.sleep(1)
+                    found_tokens = get_existing_token_set()
+                    if all(token in found_tokens for _, token, _ in append_meta):
+                        break
+
+                for label, token, sign_url in append_meta:
+                    if token in found_tokens:
+                        success_count += 1
+                        messages.append(f"✅ {label}：補登成功且回查存在｜{sign_url}")
+                    else:
+                        verify_failed.append(token)
+                        fail_count += 1
+                        messages.append(f"⚠️ {label}：已批次寫入，但回查仍找不到 token，請先不要把此連結給客戶")
+            except Exception as exc:
+                fail_count += len(rows_to_append)
+                messages.append(f"❌ 批次補登失敗：{short_error(exc)}")
+
+        if success_count:
+            st.success(f"已成功補登並回查確認 {success_count} 筆舊簽收連結。")
+        if skipped_count:
+            st.info(f"有 {skipped_count} 筆 token 已存在，已略過。")
+        if fail_count:
+            st.error(f"有 {fail_count} 筆補登失敗或回查失敗，請查看訊息。")
+
+        st.code("\n".join(messages), language="text")
+        st.info("補登後請到 Google Sheet 用 Ctrl+F 搜尋其中一個 token；再用原本客戶簽收網址測試。")
 
 
 # ---------- 廠內端：查詢簽收紀錄 ----------
@@ -2114,7 +2357,7 @@ def admin_page():
         st.stop()
 
     st.title("📦 新豐製版｜數位簽收管理")
-    st.caption("廠內建立簽收單後，系統會產生 token 專屬連結；v1.18 起會回查 Google Sheet，確認 token 寫入後才顯示客戶連結。")
+    st.caption("廠內建立簽收單後，系統會產生 token 專屬連結；v1.19 起會回查 Google Sheet，確認 token 寫入後才顯示客戶連結。")
 
     if not get_drive_folder_id():
         st.warning("尚未設定 GOOGLE_DRIVE_FOLDER_ID；客戶簽收仍可完成，但公司/帳務聯不會自動保存到 Google Drive。")
