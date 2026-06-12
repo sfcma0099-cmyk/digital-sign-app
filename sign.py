@@ -25,7 +25,7 @@ from streamlit_drawable_canvas import st_canvas
 
 
 # =========================================================
-# 新豐製版：Token 版數位簽收系統 v1.19
+# 新豐製版：Token 版數位簽收系統 v1.20
 # ---------------------------------------------------------
 # 這支 app.py 同時包含：
 # 1) 廠內端：建立簽收單、批量建立連結、查詢簽收狀態
@@ -270,15 +270,55 @@ def find_record_by_token(token: str):
     return None, None
 
 
-def append_record(record: dict):
+def get_next_write_row(worksheet) -> int:
+    """
+    v1.20：用「整張表最後一列有資料的位置」判斷下一個可寫入列。
+    不再依賴 Google Sheets values.append 的 table range 判斷，避免新版 Google 表格/篩選表格
+    導致補登資料覆蓋到上一筆或寫到同一列。
+    """
+    values = worksheet.get_all_values()
+    last_non_empty = 1
+    for row_index, row in enumerate(values, start=1):
+        if any(str(cell).strip() for cell in row):
+            last_non_empty = row_index
+    return last_non_empty + 1
+
+
+def safe_append_rows(row_values_list: list[list]) -> int:
+    """
+    v1.20：安全新增多列。
+    回傳實際開始寫入的列號，方便排查。
+    """
+    if not row_values_list:
+        return 0
     ws = get_worksheet()
+    start_row = get_next_write_row(ws)
+    end_row = start_row + len(row_values_list) - 1
+    end_col = column_letter(len(HEADERS))
+
+    normalized_rows = []
+    for row in row_values_list:
+        row = list(row)
+        if len(row) < len(HEADERS):
+            row = row + [""] * (len(HEADERS) - len(row))
+        normalized_rows.append(row[: len(HEADERS)])
+
+    ws.update(
+        range_name=f"A{start_row}:{end_col}{end_row}",
+        values=normalized_rows,
+        value_input_option="USER_ENTERED",
+    )
+    return start_row
+
+
+def append_record(record: dict):
     row_values = [record.get(header, "") for header in HEADERS]
-    ws.append_row(row_values, value_input_option="USER_ENTERED")
+    safe_append_rows([row_values])
 
 
 def append_record_and_verify(record: dict) -> bool:
     """
-    v1.19：建立簽收單後立即回查 Google Sheet。
+    v1.20：建立簽收單後立即回查 Google Sheet。
     只有確認 token 真的存在台帳，才顯示可傳給客戶的連結，避免「LINE 文字產生了，但 Sheet 沒寫入」的情況。
     """
     append_record(record)
@@ -906,7 +946,7 @@ def split_label_value(line: str):
 
 def parse_legacy_token_blocks(text: str) -> list:
     """
-    v1.19：解析舊 LINE 通知整理資料。
+    v1.20：解析舊 LINE 通知整理資料。
     支援格式：
     token：xxx
     客戶：禎曜
@@ -973,7 +1013,7 @@ def validate_legacy_record_data(item: dict) -> list:
 
 def admin_legacy_restore_tab():
     st.subheader("🧯 補登舊簽收連結 / token 復活")
-    st.caption("v1.19：用原本傳給客戶的 token 補回 Google Sheet，讓舊簽收網址重新有效。")
+    st.caption("v1.20：用原本傳給客戶的 token 補回 Google Sheet，讓舊簽收網址重新有效。")
 
     st.warning("token 必須完全照原簽收網址複製；大小寫、0/O、1/l/I 只要不同，原連結就不會復活。建議直接從 LINE 訊息中的網址複製 token。")
 
@@ -1055,7 +1095,7 @@ def admin_legacy_restore_tab():
                     sales_rep=str(item.get("sales_rep", "")),
                     token_override=token,
                 )
-                record["archive_note"] = "v1.19 舊 token 補登；原簽收連結已重新啟用，需客戶重新簽收後才會產生正式憑證。"
+                record["archive_note"] = "v1.20 舊 token 補登；使用安全寫入列避免覆蓋；原簽收連結已重新啟用，需客戶重新簽收後才會產生正式憑證。"
 
                 try:
                     if append_record_and_verify(record):
@@ -1081,7 +1121,7 @@ def admin_legacy_restore_tab():
 
 
 
-# ---------- v1.19：補登舊連結強化版 ----------
+# ---------- v1.20：補登舊連結強化版 ----------
 def normalize_legacy_token_value(value: str) -> str:
     """把使用者貼上的 token 或完整簽收網址整理成真正 token。"""
     text = str(value or "").strip()
@@ -1112,7 +1152,7 @@ def normalize_legacy_token_value(value: str) -> str:
 
 def parse_legacy_token_blocks_v119(text: str) -> list:
     """
-    v1.19：更耐用的舊 LINE 通知解析。
+    v1.20：更耐用的舊 LINE 通知解析。
     支援：
     1) token：xxxx
     2) token：https://.../?token=xxxx
@@ -1193,7 +1233,7 @@ def get_existing_token_set() -> set:
 
 def admin_legacy_restore_tab():
     st.subheader("🧯 補登舊簽收連結 / token 復活")
-    st.caption("v1.19 強化：可貼完整 LINE 簽收網址；系統會自動取出 token，並用批次寫入後逐筆回查。")
+    st.caption("v1.20 強化：可貼完整 LINE 簽收網址；系統會自動取出 token，並改用安全寫入列，避免兩筆 token 寫到同一列。")
 
     st.info(
         "用途：把之前已傳給客戶、但沒有成功留在 Google Sheet 台帳的舊簽收連結補回來。"
@@ -1278,7 +1318,7 @@ def admin_legacy_restore_tab():
                 sales_rep=str(item.get("sales_rep", "")),
                 token_override=token,
             )
-            record["archive_note"] = "v1.19 舊 token 補登；原簽收連結已重新啟用，需客戶重新簽收後才會產生正式憑證。"
+            record["archive_note"] = "v1.20 舊 token 補登；使用安全寫入列避免覆蓋；原簽收連結已重新啟用，需客戶重新簽收後才會產生正式憑證。"
             rows_to_append.append([record.get(header, "") for header in HEADERS])
             append_meta.append((label, token, record.get("sign_url", "")))
             existing_tokens.add(token)
@@ -1288,8 +1328,8 @@ def admin_legacy_restore_tab():
 
         if rows_to_append:
             try:
-                ws = get_worksheet()
-                ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
+                start_row = safe_append_rows(rows_to_append)
+                messages.append(f"🧾 本次從 Google Sheet 第 {start_row} 列開始安全寫入 {len(rows_to_append)} 筆。")
                 # 等 Google Sheets 寫入完成，再回查。最多試 3 次。
                 found_tokens = set()
                 for _ in range(3):
@@ -2357,7 +2397,7 @@ def admin_page():
         st.stop()
 
     st.title("📦 新豐製版｜數位簽收管理")
-    st.caption("廠內建立簽收單後，系統會產生 token 專屬連結；v1.19 起會回查 Google Sheet，確認 token 寫入後才顯示客戶連結。")
+    st.caption("廠內建立簽收單後，系統會產生 token 專屬連結；v1.20 起會回查 Google Sheet，確認 token 寫入後才顯示客戶連結。")
 
     if not get_drive_folder_id():
         st.warning("尚未設定 GOOGLE_DRIVE_FOLDER_ID；客戶簽收仍可完成，但公司/帳務聯不會自動保存到 Google Drive。")
