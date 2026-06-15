@@ -25,7 +25,7 @@ from streamlit_drawable_canvas import st_canvas
 
 
 # =========================================================
-# 新豐製版：Token 版數位簽收系統 v1.21
+# 新豐製版：Token 版數位簽收系統 v1.22
 # ---------------------------------------------------------
 # 這支 app.py 同時包含：
 # 1) 廠內端：建立簽收單、批量建立連結、查詢簽收狀態
@@ -39,7 +39,7 @@ from streamlit_drawable_canvas import st_canvas
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 
 POPULAR_CLIENTS = ["禎曜", "金森", "三和", "合歷", "佳鑫", "紙城", "易昇", "榮星"]
-POPULAR_SALES_REPS = ["偉智", "郁航"]
+POPULAR_SALES_REPS = ["偉智", "郁航", "笠陽", "鈺婷", "徐鈺婷", "哲賢"]
 
 HEADERS = [
     "token",
@@ -840,9 +840,19 @@ def parse_batch_line(line: str):
     if not line:
         return None
 
-    parts = [part.strip() for part in line.split(",")]
+    if "," in line:
+        parts = [part.strip() for part in line.split(",")]
+    else:
+        # v1.22：支援廠內常用格式「客戶-品名/單號」。只切第一個連字號，避免品名內的 - 被切壞。
+        normalized_line = line.replace("－", "-").replace("—", "-").replace("–", "-")
+        if "-" in normalized_line:
+            first, rest = normalized_line.split("-", 1)
+            parts = [first.strip(), rest.strip()]
+        else:
+            parts = [line.strip()]
+
     if len(parts) < 2:
-        raise ValueError("缺少逗號或欄位不足")
+        raise ValueError("缺少逗號 / 連字號，或欄位不足")
 
     client_name = parts[0]
     product_name = parts[1]
@@ -863,18 +873,32 @@ def parse_batch_line(line: str):
 
 def admin_batch_tab():
     st.subheader("🚀 批量建立簽收單")
-    st.info("每一行代表一張簽收單。格式：客戶名稱, 品名單號, 數量, 業務, 備註。數量、業務、備註可視情況省略，也支援中文逗號。")
+    st.info("每一行代表一張簽收單。格式：客戶名稱, 品名單號, 數量, 業務, 備註。數量、業務、備註可視情況省略，也支援中文逗號；也可用『客戶-品名單號』快速貼上。")
 
     default_text = "禎曜, 達創-001, 1片, 偉智, 早班配送\n金森, 刀模-002\n三和, 紙盒-003, 2組"
     batch_input = st.text_area("貼上今日派單資料", value=default_text, height=220)
     delivery_date = st.date_input("這批資料的出貨日期", key="batch_delivery_date").strftime("%Y-%m-%d")
-    default_sales_rep = st.selectbox(
+    batch_sales_mode = st.radio(
         "這批資料的預設業務",
-        [""] + POPULAR_SALES_REPS,
-        format_func=lambda x: "不填寫" if x == "" else x,
-        key="batch_default_sales_rep",
+        ["不填寫", "從常用清單選擇", "手動自行輸入"],
+        horizontal=True,
+        key="batch_sales_rep_mode",
     )
-    st.caption("若單行有填業務，會優先使用單行業務；否則使用這批預設業務。")
+    if batch_sales_mode == "從常用清單選擇":
+        default_sales_rep = st.selectbox(
+            "選擇預設業務",
+            POPULAR_SALES_REPS,
+            key="batch_default_sales_rep_select",
+        )
+    elif batch_sales_mode == "手動自行輸入":
+        default_sales_rep = st.text_input(
+            "手動輸入這批資料的預設業務",
+            placeholder="例如：笠陽、偉智、鈺婷",
+            key="batch_default_sales_rep_text",
+        ).strip()
+    else:
+        default_sales_rep = ""
+    st.caption("若單行有填業務，會優先使用單行業務；否則使用這批預設業務。v1.22 起可手動輸入批量預設業務。")
 
     if st.button("一鍵建立全部簽收單", type="primary"):
         lines = batch_input.splitlines()
@@ -2740,7 +2764,7 @@ def apply_sheet_ledger_format(hide_internal_columns: bool = True, future_rows: i
 
 def admin_tools_tab():
     st.subheader("🧰 系統工具")
-    st.caption("v1.21：長期整理 Google Sheet 台帳格式。這裡只調整格式，不修改簽收資料內容。")
+    st.caption("v1.22：保留 Google Sheet 台帳美化工具，並修正批量建立可手動輸入預設業務。")
 
     st.write("### 🎨 Google Sheet 台帳美化")
     st.write(
@@ -2781,7 +2805,7 @@ def admin_page():
         st.stop()
 
     st.title("📦 新豐製版｜數位簽收管理")
-    st.caption("廠內建立簽收單後，系統會產生 token 專屬連結；v1.21 起保留 v1.20 回查機制，並新增 Google Sheet 台帳美化工具；v1.20 起會回查 Google Sheet，確認 token 寫入後才顯示客戶連結。")
+    st.caption("廠內建立簽收單後，系統會產生 token 專屬連結；v1.22 起批量建立可手動輸入預設業務，並保留 Google Sheet 台帳美化工具與 token 回查機制。")
 
     if not get_drive_folder_id():
         st.warning("尚未設定 GOOGLE_DRIVE_FOLDER_ID；客戶簽收仍可完成，但公司/帳務聯不會自動保存到 Google Drive。")
