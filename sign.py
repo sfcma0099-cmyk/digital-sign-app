@@ -25,7 +25,7 @@ from streamlit_drawable_canvas import st_canvas
 
 
 # =========================================================
-# 新豐製版：Token 版數位簽收系統 v1.20
+# 新豐製版：Token 版數位簽收系統 v1.21
 # ---------------------------------------------------------
 # 這支 app.py 同時包含：
 # 1) 廠內端：建立簽收單、批量建立連結、查詢簽收狀態
@@ -2387,6 +2387,390 @@ def customer_signing_page(token: str):
         st.stop()
 
 
+
+
+# ---------- v1.21：Google Sheet 台帳美化 / 長期格式整理 ----------
+def rgb_color(hex_text: str) -> dict:
+    """#RRGGBB -> Google Sheets API RGB color dict。"""
+    value = str(hex_text or "").strip().lstrip("#")
+    if len(value) != 6:
+        value = "FFFFFF"
+    return {
+        "red": int(value[0:2], 16) / 255,
+        "green": int(value[2:4], 16) / 255,
+        "blue": int(value[4:6], 16) / 255,
+    }
+
+
+def header_index(header_name: str) -> int:
+    """回傳 0-based 欄位 index。"""
+    return HEADERS.index(header_name)
+
+
+def get_sheet_metadata_for_current_tab(worksheet):
+    metadata = worksheet.spreadsheet.fetch_sheet_metadata()
+    for sheet in metadata.get("sheets", []):
+        if sheet.get("properties", {}).get("sheetId") == worksheet.id:
+            return sheet
+    return {}
+
+
+def delete_existing_banding_requests(worksheet) -> list:
+    """刪除目前工作表既有的 banded range，避免每次按美化就疊加多組交錯底色。"""
+    sheet_meta = get_sheet_metadata_for_current_tab(worksheet)
+    requests = []
+    for banding in sheet_meta.get("bandedRanges", []) or []:
+        banding_id = banding.get("bandedRangeId")
+        if banding_id is not None:
+            requests.append({"deleteBanding": {"bandedRangeId": banding_id}})
+    return requests
+
+
+def build_column_width_requests(sheet_id: int) -> list:
+    """依欄位用途設定較好閱讀的寬度。"""
+    widths = {
+        "token": 250,
+        "created_at": 150,
+        "status": 95,
+        "client_name": 120,
+        "product_name": 280,
+        "quantity": 100,
+        "delivery_date": 120,
+        "note": 220,
+        "sign_url": 320,
+        "signed_at": 150,
+        "signer_name": 110,
+        "signer_phone": 130,
+        "signer_note": 200,
+        "signature_png_base64": 80,
+        "signature_json": 80,
+        "signed_device_hint": 150,
+        "signature_image_url": 280,
+        "receipt_file_url": 300,
+        "receipt_folder_url": 260,
+        "billing_month": 120,
+        "billing_status": 120,
+        "archive_note": 340,
+        "sales_rep": 110,
+        "billing_settled_at": 150,
+    }
+    requests = []
+    for header, width in widths.items():
+        if header not in HEADERS:
+            continue
+        col_index = header_index(header)
+        requests.append(
+            {
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "COLUMNS",
+                        "startIndex": col_index,
+                        "endIndex": col_index + 1,
+                    },
+                    "properties": {"pixelSize": width},
+                    "fields": "pixelSize",
+                }
+            }
+        )
+    return requests
+
+
+def build_hide_internal_columns_requests(sheet_id: int, hide_internal: bool) -> list:
+    """隱藏 / 顯示內部技術欄位，讓台帳比較像正式帳務資料。"""
+    internal_headers = ["signature_png_base64", "signature_json", "signed_device_hint"]
+    requests = []
+    for header in internal_headers:
+        if header not in HEADERS:
+            continue
+        col_index = header_index(header)
+        requests.append(
+            {
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "COLUMNS",
+                        "startIndex": col_index,
+                        "endIndex": col_index + 1,
+                    },
+                    "properties": {"hiddenByUser": bool(hide_internal)},
+                    "fields": "hiddenByUser",
+                }
+            }
+        )
+    return requests
+
+
+def build_data_validation_requests(sheet_id: int, format_row_count: int) -> list:
+    """套用狀態與月結欄位下拉選單，後續手動維護也比較不容易打錯字。"""
+    if format_row_count <= 1:
+        format_row_count = 500
+
+    requests = []
+
+    status_col = header_index("status")
+    requests.append(
+        {
+            "setDataValidation": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 1,
+                    "endRowIndex": format_row_count,
+                    "startColumnIndex": status_col,
+                    "endColumnIndex": status_col + 1,
+                },
+                "rule": {
+                    "condition": {
+                        "type": "ONE_OF_LIST",
+                        "values": [
+                            {"userEnteredValue": STATUS_PENDING},
+                            {"userEnteredValue": STATUS_SIGNED},
+                        ],
+                    },
+                    "showCustomUi": True,
+                    "strict": True,
+                },
+            }
+        }
+    )
+
+    billing_col = header_index("billing_status")
+    requests.append(
+        {
+            "setDataValidation": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 1,
+                    "endRowIndex": format_row_count,
+                    "startColumnIndex": billing_col,
+                    "endColumnIndex": billing_col + 1,
+                },
+                "rule": {
+                    "condition": {
+                        "type": "ONE_OF_LIST",
+                        "values": [
+                            {"userEnteredValue": "未結帳"},
+                            {"userEnteredValue": "已結帳"},
+                        ],
+                    },
+                    "showCustomUi": True,
+                    "strict": False,
+                },
+            }
+        }
+    )
+
+    return requests
+
+
+def apply_sheet_ledger_format(hide_internal_columns: bool = True, future_rows: int = 500) -> dict:
+    """
+    v1.21：把 Google Sheet 台帳套用成長期使用的正式格式。
+    只改格式 / 欄寬 / 篩選 / 下拉選單，不改任何簽收資料內容。
+    """
+    ws = get_worksheet()
+    ensure_headers(ws)
+
+    values = ws.get_all_values()
+    last_row_with_data = max(len(values), 1)
+    desired_rows = max(last_row_with_data + 80, future_rows)
+    desired_cols = len(HEADERS)
+
+    # 確保有足夠空白列可先套格式，之後新增資料不用每次手動美化。
+    if ws.row_count < desired_rows or ws.col_count < desired_cols:
+        ws.resize(rows=max(ws.row_count, desired_rows), cols=max(ws.col_count, desired_cols))
+
+    # resize 後重抓一次較保險。
+    format_row_count = max(ws.row_count, desired_rows)
+    sheet_id = ws.id
+    end_col_index = len(HEADERS)
+
+    requests = []
+    requests.extend(delete_existing_banding_requests(ws))
+
+    # 固定表頭。
+    requests.append(
+        {
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": sheet_id,
+                    "gridProperties": {"frozenRowCount": 1},
+                },
+                "fields": "gridProperties.frozenRowCount",
+            }
+        }
+    )
+
+    # 基本篩選範圍。
+    requests.append(
+        {
+            "setBasicFilter": {
+                "filter": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 0,
+                        "endRowIndex": format_row_count,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": end_col_index,
+                    }
+                }
+            }
+        }
+    )
+
+    # 交錯底色。
+    requests.append(
+        {
+            "addBanding": {
+                "bandedRange": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 0,
+                        "endRowIndex": format_row_count,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": end_col_index,
+                    },
+                    "rowProperties": {
+                        "headerColor": rgb_color("2F6B57"),
+                        "firstBandColor": rgb_color("FFFFFF"),
+                        "secondBandColor": rgb_color("F6F8FA"),
+                    },
+                }
+            }
+        }
+    )
+
+    # 表頭格式。
+    requests.append(
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": end_col_index,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": rgb_color("2F6B57"),
+                        "horizontalAlignment": "CENTER",
+                        "verticalAlignment": "MIDDLE",
+                        "wrapStrategy": "WRAP",
+                        "textFormat": {
+                            "foregroundColor": rgb_color("FFFFFF"),
+                            "fontSize": 10,
+                            "bold": True,
+                        },
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,wrapStrategy,textFormat)",
+            }
+        }
+    )
+
+    # 內容基本格式。
+    requests.append(
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 1,
+                    "endRowIndex": format_row_count,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": end_col_index,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "verticalAlignment": "MIDDLE",
+                        "wrapStrategy": "WRAP",
+                        "textFormat": {"fontSize": 10},
+                    }
+                },
+                "fields": "userEnteredFormat(verticalAlignment,wrapStrategy,textFormat.fontSize)",
+            }
+        }
+    )
+
+    # 日期 / 狀態 / 數量等欄位置中。
+    center_headers = [
+        "created_at",
+        "status",
+        "quantity",
+        "delivery_date",
+        "signed_at",
+        "billing_month",
+        "billing_status",
+        "sales_rep",
+        "billing_settled_at",
+    ]
+    for header in center_headers:
+        if header not in HEADERS:
+            continue
+        col_index = header_index(header)
+        requests.append(
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 1,
+                        "endRowIndex": format_row_count,
+                        "startColumnIndex": col_index,
+                        "endColumnIndex": col_index + 1,
+                    },
+                    "cell": {"userEnteredFormat": {"horizontalAlignment": "CENTER"}},
+                    "fields": "userEnteredFormat.horizontalAlignment",
+                }
+            }
+        )
+
+    requests.extend(build_column_width_requests(sheet_id))
+    requests.extend(build_hide_internal_columns_requests(sheet_id, hide_internal_columns))
+    requests.extend(build_data_validation_requests(sheet_id, format_row_count))
+
+    ws.spreadsheet.batch_update({"requests": requests})
+
+    return {
+        "last_row_with_data": last_row_with_data,
+        "format_row_count": format_row_count,
+        "formatted_columns": len(HEADERS),
+        "hide_internal_columns": hide_internal_columns,
+    }
+
+
+def admin_tools_tab():
+    st.subheader("🧰 系統工具")
+    st.caption("v1.21：長期整理 Google Sheet 台帳格式。這裡只調整格式，不修改簽收資料內容。")
+
+    st.write("### 🎨 Google Sheet 台帳美化")
+    st.write(
+        "按下後會套用：固定表頭、深綠表頭、交錯底色、欄寬整理、狀態下拉選單、月結狀態下拉選單。"
+    )
+
+    hide_internal = st.checkbox(
+        "隱藏內部技術欄位（簽章 base64 / 簽章 JSON / 裝置提示）",
+        value=True,
+        help="只是隱藏欄位，不會刪除資料；需要時可在 Google Sheet 取消隱藏。",
+    )
+
+    if st.button("🎨 套用 Google Sheet 台帳格式", type="primary"):
+        with st.spinner("正在整理 Google Sheet 格式..."):
+            try:
+                result = apply_sheet_ledger_format(hide_internal_columns=hide_internal)
+            except Exception as exc:
+                st.error("套用格式失敗，請截圖錯誤訊息給我。")
+                st.code(short_error(exc), language="text")
+                return
+
+        st.success("Google Sheet 台帳格式已套用完成。")
+        st.write(
+            f"已整理目前 {result['last_row_with_data']} 列資料，並預先套用到第 {result['format_row_count']} 列。"
+        )
+        if result.get("hide_internal_columns"):
+            st.info("已隱藏內部技術欄位；這些資料沒有刪除，只是讓台帳畫面更乾淨。")
+        st.info("回到 Google Sheet 重新整理頁面後，就會看到新格式。")
+
+
 # ---------- 廠內端主畫面 ----------
 def admin_page():
     if not config_is_ready():
@@ -2397,14 +2781,14 @@ def admin_page():
         st.stop()
 
     st.title("📦 新豐製版｜數位簽收管理")
-    st.caption("廠內建立簽收單後，系統會產生 token 專屬連結；v1.20 起會回查 Google Sheet，確認 token 寫入後才顯示客戶連結。")
+    st.caption("廠內建立簽收單後，系統會產生 token 專屬連結；v1.21 起保留 v1.20 回查機制，並新增 Google Sheet 台帳美化工具；v1.20 起會回查 Google Sheet，確認 token 寫入後才顯示客戶連結。")
 
     if not get_drive_folder_id():
         st.warning("尚未設定 GOOGLE_DRIVE_FOLDER_ID；客戶簽收仍可完成，但公司/帳務聯不會自動保存到 Google Drive。")
     elif not get_drive_upload_webapp_url() or not get_drive_upload_secret():
         st.warning("尚未設定 DRIVE_UPLOAD_WEBAPP_URL 或 DRIVE_UPLOAD_SECRET；客戶簽收仍可完成，但公司/帳務聯不會自動保存到 Google Drive。")
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📝 單筆建立", "🚀 批量建立", "📋 狀態查詢", "💰 月底結帳", "🧯 補登舊連結"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📝 單筆建立", "🚀 批量建立", "📋 狀態查詢", "💰 月底結帳", "🧯 補登舊連結", "🧰 系統工具"])
 
     with tab1:
         admin_create_single_tab()
@@ -2420,6 +2804,9 @@ def admin_page():
 
     with tab5:
         admin_legacy_restore_tab()
+
+    with tab6:
+        admin_tools_tab()
 
     st.write("---")
     if st.button("登出管理端"):
