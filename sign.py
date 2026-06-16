@@ -25,7 +25,7 @@ from streamlit_drawable_canvas import st_canvas
 
 
 # =========================================================
-# 新豐製版：Token 版數位簽收系統 v1.22
+# 新豐製版：Token 版數位簽收系統 v1.23
 # ---------------------------------------------------------
 # 這支 app.py 同時包含：
 # 1) 廠內端：建立簽收單、批量建立連結、查詢簽收狀態
@@ -78,6 +78,71 @@ st.set_page_config(
     page_icon="🖊️",
     layout="centered",
 )
+
+
+def inject_mobile_friendly_css():
+    """v1.23：讓管理端在手機 Google Chrome 上更好操作。"""
+    st.markdown(
+        """
+        <style>
+        /* 手機瀏覽時縮小左右留白，讓表單與按鈕有完整寬度 */
+        @media (max-width: 768px) {
+            .block-container {
+                padding-top: 1.0rem !important;
+                padding-left: 0.85rem !important;
+                padding-right: 0.85rem !important;
+                max-width: 100% !important;
+            }
+            h1 {
+                font-size: 1.65rem !important;
+                line-height: 1.25 !important;
+            }
+            h2, h3 {
+                font-size: 1.25rem !important;
+                line-height: 1.25 !important;
+            }
+            p, label, div, span {
+                font-size: 0.98rem;
+            }
+            /* 避免手機 Chrome 點輸入框自動放大 */
+            input, textarea, select {
+                font-size: 16px !important;
+            }
+            textarea {
+                min-height: 180px !important;
+            }
+            .stButton > button,
+            .stDownloadButton > button,
+            .stLinkButton > a,
+            button[kind="primary"],
+            button[kind="secondary"] {
+                width: 100% !important;
+                min-height: 46px !important;
+                border-radius: 12px !important;
+                font-size: 1rem !important;
+                white-space: normal !important;
+            }
+            [data-testid="stFormSubmitButton"] button {
+                width: 100% !important;
+                min-height: 46px !important;
+                border-radius: 12px !important;
+            }
+            .stTextInput, .stTextArea, .stSelectbox, .stDateInput, .stRadio {
+                margin-bottom: 0.85rem !important;
+            }
+            /* 程式碼 / LINE 文字在手機可橫向捲動，不會撐爆畫面 */
+            pre, code {
+                white-space: pre-wrap !important;
+                word-break: break-word !important;
+            }
+            [data-testid="stDataFrame"] {
+                overflow-x: auto !important;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 # ---------- Secrets 讀取 ----------
@@ -2764,7 +2829,7 @@ def apply_sheet_ledger_format(hide_internal_columns: bool = True, future_rows: i
 
 def admin_tools_tab():
     st.subheader("🧰 系統工具")
-    st.caption("v1.22：保留 Google Sheet 台帳美化工具，並修正批量建立可手動輸入預設業務。")
+    st.caption("v1.23：管理端手機友善版，保留 Google Sheet 台帳美化工具與批量業務手動輸入。")
 
     st.write("### 🎨 Google Sheet 台帳美化")
     st.write(
@@ -2805,31 +2870,41 @@ def admin_page():
         st.stop()
 
     st.title("📦 新豐製版｜數位簽收管理")
-    st.caption("廠內建立簽收單後，系統會產生 token 專屬連結；v1.22 起批量建立可手動輸入預設業務，並保留 Google Sheet 台帳美化工具與 token 回查機制。")
+    st.caption("v1.23 手機友善版：管理端改用下拉式功能選單，手機 Google Chrome 不用左右滑分頁也能操作。")
 
     if not get_drive_folder_id():
         st.warning("尚未設定 GOOGLE_DRIVE_FOLDER_ID；客戶簽收仍可完成，但公司/帳務聯不會自動保存到 Google Drive。")
     elif not get_drive_upload_webapp_url() or not get_drive_upload_secret():
         st.warning("尚未設定 DRIVE_UPLOAD_WEBAPP_URL 或 DRIVE_UPLOAD_SECRET；客戶簽收仍可完成，但公司/帳務聯不會自動保存到 Google Drive。")
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📝 單筆建立", "🚀 批量建立", "📋 狀態查詢", "💰 月底結帳", "🧯 補登舊連結", "🧰 系統工具"])
+    admin_sections = [
+        "📝 單筆建立",
+        "🚀 批量建立",
+        "📋 狀態查詢",
+        "💰 月底結帳",
+        "🧯 補登舊連結",
+        "🧰 系統工具",
+    ]
+    selected_section = st.selectbox(
+        "選擇管理功能",
+        admin_sections,
+        key="admin_mobile_section",
+        help="手機版建議使用這個下拉選單切換功能，比分頁更穩定。",
+    )
 
-    with tab1:
+    st.write("---")
+
+    if selected_section == "📝 單筆建立":
         admin_create_single_tab()
-
-    with tab2:
+    elif selected_section == "🚀 批量建立":
         admin_batch_tab()
-
-    with tab3:
+    elif selected_section == "📋 狀態查詢":
         admin_dashboard_tab()
-
-    with tab4:
+    elif selected_section == "💰 月底結帳":
         admin_billing_tab()
-
-    with tab5:
+    elif selected_section == "🧯 補登舊連結":
         admin_legacy_restore_tab()
-
-    with tab6:
+    elif selected_section == "🧰 系統工具":
         admin_tools_tab()
 
     st.write("---")
@@ -2840,6 +2915,7 @@ def admin_page():
 
 # ---------- 入口 ----------
 def main():
+    inject_mobile_friendly_css()
     token = str(st.query_params.get("token", "")).strip()
 
     if token:
